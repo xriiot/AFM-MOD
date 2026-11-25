@@ -70,9 +70,33 @@ struct DelayDecision {
 
 struct ActivationSnapshot {
     GameObject* obj = nullptr;
+    EffectGameObject* effectObj = nullptr;
+    bool isActivated = false;
     bool activatedP1 = false;
     bool activatedP2 = false;
 };
+
+template <typename E>
+void saveEffectActivation(E* e, bool& outP1, bool& outP2) {
+    if (!e) return;
+    if constexpr (requires { e->m_hasBeenActivated; }) {
+        outP1 = e->m_hasBeenActivated;
+    }
+    if constexpr (requires { e->m_hasBeenActivatedP2; }) {
+        outP2 = e->m_hasBeenActivatedP2;
+    }
+}
+
+template <typename E>
+void restoreEffectActivation(E* e, bool p1, bool p2) {
+    if (!e) return;
+    if constexpr (requires { e->m_hasBeenActivated; }) {
+        e->m_hasBeenActivated = p1;
+    }
+    if constexpr (requires { e->m_hasBeenActivatedP2; }) {
+        e->m_hasBeenActivatedP2 = p2;
+    }
+}
 
 VehicleMode detectVehicle(PlayerObject* player) {
     if (!player) return VehicleMode::Cube;
@@ -163,12 +187,27 @@ bool isGhostInteractivePhysicsObject(GameObject* obj) {
     }
 }
 
+ActivationSnapshot captureObjectSnapshot(GameObject* obj) {
+    ActivationSnapshot snap;
+    snap.obj = obj;
+    if (!obj) return snap;
+    snap.isActivated = obj->m_isActivated;
+    snap.effectObj = typeinfo_cast<EffectGameObject*>(obj);
+    saveEffectActivation(snap.effectObj, snap.activatedP1, snap.activatedP2);
+    return snap;
+}
+
+void updateObjectSnapshot(ActivationSnapshot& snap) {
+    if (!snap.obj) return;
+    snap.isActivated = snap.obj->m_isActivated;
+    saveEffectActivation(snap.effectObj, snap.activatedP1, snap.activatedP2);
+}
+
 void restoreSnapshots(std::vector<ActivationSnapshot> const& snapshots) {
     for (auto const& snap : snapshots) {
-        if (snap.obj) {
-            snap.obj->m_hasBeenActivated = snap.activatedP1;
-            snap.obj->m_hasBeenActivatedP2 = snap.activatedP2;
-        }
+        if (!snap.obj) continue;
+        snap.obj->m_isActivated = snap.isActivated;
+        restoreEffectActivation(snap.effectObj, snap.activatedP1, snap.activatedP2);
     }
 }
 
@@ -855,7 +894,7 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
         for (; it != m_fields->interactiveObjects.end(); ++it) {
             GameObject* obj = *it;
             if (obj->getPositionX() > maxX) break;
-            out.push_back({obj, obj->m_hasBeenActivated, obj->m_hasBeenActivatedP2});
+            out.push_back(captureObjectSnapshot(obj));
         }
     }
 
@@ -1100,10 +1139,7 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
 
             // Actualizar snapshot del prefijo actual para restaurar tras la sonda
             for (auto& snap : prefixStateSnaps) {
-                if (snap.obj) {
-                    snap.activatedP1 = snap.obj->m_hasBeenActivated;
-                    snap.activatedP2 = snap.obj->m_hasBeenActivatedP2;
-                }
+                updateObjectSnapshot(snap);
             }
 
             ProbeOutcome probeOut = runProbeFromBase(prefix, actionDown, lookaheadTicks, prefixStateSnaps);

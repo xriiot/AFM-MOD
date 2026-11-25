@@ -586,93 +586,7 @@ class $modify(FrameAssistMenuLayer, MenuLayer) {
 };
 
 // ============================================================================
-// 3. AISLAMIENTO VISUAL Y DE EFECTOS DEL JUGADOR FANTASMA (PlayerObject)
-// Impide que los clones fantasmas generen particulas, estelas, sonido o saltos.
-// ============================================================================
-class $modify(GhostIsolatedPlayerObject, PlayerObject) {
-    void playDeathEffect() {
-        if (g_simulatingGhost || isGhostPlayer(this)) return;
-        PlayerObject::playDeathEffect();
-    }
-
-    void playSpawnEffect() {
-        if (g_simulatingGhost || isGhostPlayer(this)) return;
-        PlayerObject::playSpawnEffect();
-    }
-
-    void playBumpEffect(int p0, GameObject* p1) {
-        if (g_simulatingGhost || isGhostPlayer(this)) return;
-        PlayerObject::playBumpEffect(p0, p1);
-    }
-
-    void playSpiderDashEffect(CCPoint p0, CCPoint p1) {
-        if (g_simulatingGhost || isGhostPlayer(this)) return;
-        PlayerObject::playSpiderDashEffect(p0, p1);
-    }
-
-    void playDynamicSpiderRun() {
-        if (g_simulatingGhost || isGhostPlayer(this)) return;
-        PlayerObject::playDynamicSpiderRun();
-    }
-
-    void playCompleteEffect(bool p0, bool p1) {
-        if (g_simulatingGhost || isGhostPlayer(this)) return;
-        PlayerObject::playCompleteEffect(p0, p1);
-    }
-
-    void activateStreak() {
-        if (g_simulatingGhost || isGhostPlayer(this)) return;
-        PlayerObject::activateStreak();
-    }
-
-    void fadeOutStreak2(float p0) {
-        if (g_simulatingGhost || isGhostPlayer(this)) return;
-        PlayerObject::fadeOutStreak2(p0);
-    }
-
-    void createFadeOutDartStreak() {
-        if (g_simulatingGhost || isGhostPlayer(this)) return;
-        PlayerObject::createFadeOutDartStreak();
-    }
-
-    void spawnCircle() {
-        if (g_simulatingGhost || isGhostPlayer(this)) return;
-        PlayerObject::spawnCircle();
-    }
-
-    void spawnDualCircle() {
-        if (g_simulatingGhost || isGhostPlayer(this)) return;
-        PlayerObject::spawnDualCircle();
-    }
-
-    void spawnPortalCircle(ccColor3B p0, float p1) {
-        if (g_simulatingGhost || isGhostPlayer(this)) return;
-        PlayerObject::spawnPortalCircle(p0, p1);
-    }
-
-    void spawnScaleCircle() {
-        if (g_simulatingGhost || isGhostPlayer(this)) return;
-        PlayerObject::spawnScaleCircle();
-    }
-
-    void toggleGhostEffect(GhostType p0) {
-        if (g_simulatingGhost || isGhostPlayer(this)) return;
-        PlayerObject::toggleGhostEffect(p0);
-    }
-
-    void incrementJumps() {
-        if (g_simulatingGhost || isGhostPlayer(this)) return;
-        PlayerObject::incrementJumps();
-    }
-
-    void updateRotation(float p0) {
-        if (g_simulatingGhost || isGhostPlayer(this)) return;
-        PlayerObject::updateRotation(p0);
-    }
-};
-
-// ============================================================================
-// 4. MOTOR FANTASMA CON FISICA REAL DEL JUEGO (GJBaseGameLayer)
+// 3. MOTOR FANTASMA CON FISICA REAL DEL JUEGO (GJBaseGameLayer)
 // Usa 2 PlayerObject invisibles (prefijo + sonda) ejecutando PlayerObject::update
 // y GJBaseGameLayer::checkCollisions a 240 TPS reales.
 // ============================================================================
@@ -694,82 +608,22 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
         std::deque<PendingAction> pendingQueue;
         int lastDelayTicks = 0;
         std::string lastReason = "LISTO";
+
+        ~Fields() {
+            if (g_ghostPrefix == prefixGhost) g_ghostPrefix = nullptr;
+            if (g_ghostProbe == probeGhost) g_ghostProbe = nullptr;
+            g_simulatingGhost = false;
+            g_ghostDied = false;
+        }
     };
 
-    // --- Bloqueo estricto de efectos secundarios del nivel durante la simulacion ---
+    // Unico hook de aislamiento necesario en GJBaseGameLayer: impide que el fantasma
+    // active triggers de nivel (Move, Toggle, SFX, End, Coins, Checkpoints)
     bool canBeActivatedByPlayer(PlayerObject* player, EffectGameObject* obj) {
         if (g_simulatingGhost || isGhostPlayer(player)) {
             return isGhostInteractivePhysicsObject(obj);
         }
         return GJBaseGameLayer::canBeActivatedByPlayer(player, obj);
-    }
-
-    void flipGravity(PlayerObject* player, bool flip, bool noEffects) {
-        if (g_simulatingGhost || isGhostPlayer(player)) {
-            GJBaseGameLayer::flipGravity(player, flip, true);
-            return;
-        }
-        GJBaseGameLayer::flipGravity(player, flip, noEffects);
-    }
-
-    void playerWillSwitchMode(PlayerObject* player, GameObject* obj) {
-        if (g_simulatingGhost || isGhostPlayer(player)) return;
-        GJBaseGameLayer::playerWillSwitchMode(player, obj);
-    }
-
-    void toggleGroup(int group, bool activate) {
-        if (g_simulatingGhost) return;
-        GJBaseGameLayer::toggleGroup(group, activate);
-    }
-
-    void pickupItem(EffectGameObject* obj) {
-        if (g_simulatingGhost) return;
-        GJBaseGameLayer::pickupItem(obj);
-    }
-
-    void checkpointActivated(CheckpointGameObject* obj) {
-        if (g_simulatingGhost) return;
-        GJBaseGameLayer::checkpointActivated(obj);
-    }
-
-    void applyTimeWarp(float scale) {
-        if (g_simulatingGhost) return;
-        GJBaseGameLayer::applyTimeWarp(scale);
-    }
-
-    void reverseDirection(EffectGameObject* obj) {
-        if (g_simulatingGhost) return;
-        GJBaseGameLayer::reverseDirection(obj);
-    }
-
-    void rotateGameplay(RotateGameplayGameObject* obj) {
-        if (g_simulatingGhost) return;
-        GJBaseGameLayer::rotateGameplay(obj);
-    }
-
-    void flipArt(bool flip) {
-        if (g_simulatingGhost) return;
-        GJBaseGameLayer::flipArt(flip);
-    }
-
-    void toggleGroundVisibility(bool vis) {
-        if (g_simulatingGhost) return;
-        GJBaseGameLayer::toggleGroundVisibility(vis);
-    }
-
-    void toggleMGVisibility(bool vis) {
-        if (g_simulatingGhost) return;
-        GJBaseGameLayer::toggleMGVisibility(vis);
-    }
-
-    void activatedAudioTrigger(SFXTriggerGameObject* obj) {
-        if (g_simulatingGhost) return;
-        GJBaseGameLayer::activatedAudioTrigger(obj);
-    }
-
-    void gameEventTriggered(GJGameEvent event, int a, int b) {
-        if (g_simulatingGhost) return;
-        GJBaseGameLayer::gameEventTriggered(event, a, b);
     }
 
     // --- Gestion del ciclo de vida de los jugadores fantasmas ---
@@ -810,7 +664,7 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
             g_ghostProbe = m_fields->probeGhost;
             return true;
         }
-        if (!m_player1 || !m_objectLayer) return false;
+        if (!m_player1 || !m_objectLayer || m_fields->elapsedTime < 0.05) return false;
 
         g_simulatingGhost = true;
 
@@ -899,9 +753,9 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
     }
 
     void syncGhostFrom(PlayerObject* dst, PlayerObject* src) {
-        dst->m_isDead = false;
         dst->resetTouchedRings(true);
         dst->copyAttributes(src);
+        dst->m_isDead = false;
         auto pos = src->getPosition();
         dst->m_position = pos;
         dst->setPosition(pos);
@@ -1312,6 +1166,10 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
     }
 
     void tickFrameAssist(float dt) {
+        if (dt <= 0.f || dt > 0.25f) {
+            m_fields->pendingQueue.clear();
+            return;
+        }
         ensureInteractiveCache();
 
         m_fields->elapsedTime += static_cast<double>(dt);
@@ -1413,7 +1271,7 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
 };
 
 // ============================================================================
-// 5. INTEGRACION CON EL NIVEL Y HUD (PlayLayer)
+// 4. INTEGRACION CON EL NIVEL Y HUD (PlayLayer)
 // ============================================================================
 class $modify(FrameAssistPlayLayer, PlayLayer) {
     struct Fields {
@@ -1454,27 +1312,7 @@ class $modify(FrameAssistPlayLayer, PlayLayer) {
         PlayLayer::destroyPlayer(player, obj);
     }
 
-    void playGravityEffect(bool flip) {
-        if (g_simulatingGhost) return;
-        PlayLayer::playGravityEffect(flip);
-    }
 
-    void activateEndTrigger(int p0, bool p1, bool p2) {
-        if (g_simulatingGhost) return;
-        PlayLayer::activateEndTrigger(p0, p1, p2);
-    }
-
-    void pauseGame(bool p0) {
-        auto base = static_cast<FrameAssistGameLayer*>(static_cast<GJBaseGameLayer*>(this));
-        base->clearPendingQueue();
-        PlayLayer::pauseGame(p0);
-    }
-
-    void onQuit() {
-        auto base = static_cast<FrameAssistGameLayer*>(static_cast<GJBaseGameLayer*>(this));
-        base->teardownGhosts();
-        PlayLayer::onQuit();
-    }
 
     void resetLevel() {
         PlayLayer::resetLevel();

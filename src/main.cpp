@@ -118,7 +118,7 @@ CCRect shrinkHazardRect(CCRect r) {
     );
 }
 
-SimState captureState(PlayerObject* p) {
+SimState captureState(PlayerObject* p, bool isHolding) {
     SimState s;
     auto pos = p->getPosition();
     auto rect = p->getObjectRect();
@@ -134,7 +134,7 @@ SimState captureState(PlayerObject* p) {
     s.vyPerFrame = static_cast<float>(p->m_yVelocity);
     s.upsideDown = p->m_isUpsideDown;
     s.onGround = p->m_isOnGround;
-    s.holding = p->m_isHolding;
+    s.holding = isHolding;
     s.mode = detectVehicle(p);
     return s;
 }
@@ -668,6 +668,7 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
     struct Fields {
         double elapsedTime = 0.0;
         int currentFrame60 = 0;
+        bool actualHolding = false;
         bool isDispatchingBuffered = false;
         bool indexBuilt = false;
         PendingAction pending;
@@ -717,6 +718,7 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
     void resetAssistState() {
         m_fields->elapsedTime = 0.0;
         m_fields->currentFrame60 = 0;
+        m_fields->actualHolding = false;
         m_fields->pending = PendingAction{};
     }
 
@@ -795,7 +797,7 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
     int findBestDelayFrame(bool actionDown, int marginFrames, int lookaheadFrames) {
         if (!m_fields->indexBuilt) buildSpatialCache();
 
-        SimState initial = captureState(m_player1);
+        SimState initial = captureState(m_player1, m_fields->actualHolding);
         float maxDist = initial.vxPerFrame * static_cast<float>(marginFrames + lookaheadFrames + 8);
         float minX = initial.x - 45.f;
         float maxX = initial.x + maxDist;
@@ -842,10 +844,17 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
         return 0;
     }
 
+    void dispatchButton(bool down, int button, bool isPlayer1) {
+        if (isPlayer1 && button == 1) {
+            m_fields->actualHolding = down;
+        }
+        GJBaseGameLayer::handleButton(down, button, isPlayer1);
+    }
+
     void handleButton(bool down, int button, bool isPlayer1) {
         // Evitar recursividad al disparar nuestras acciones retenidas
         if (m_fields->isDispatchingBuffered || !isPlayer1 || button != 1 || !isAssistActive()) {
-            GJBaseGameLayer::handleButton(down, button, isPlayer1);
+            dispatchButton(down, button, isPlayer1);
             return;
         }
 
@@ -854,7 +863,7 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
 
         if ((down && !assistPress) || (!down && !assistRelease)) {
             m_fields->pending.active = false;
-            GJBaseGameLayer::handleButton(down, button, isPlayer1);
+            dispatchButton(down, button, isPlayer1);
             return;
         }
 
@@ -865,7 +874,7 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
 
         if (bestDelay <= 0) {
             m_fields->pending.active = false;
-            GJBaseGameLayer::handleButton(down, button, isPlayer1);
+            dispatchButton(down, button, isPlayer1);
             return;
         }
 
@@ -916,7 +925,7 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
             m_fields->pending.active = false;
 
             m_fields->isDispatchingBuffered = true;
-            GJBaseGameLayer::handleButton(action.down, action.button, action.isPlayer1);
+            dispatchButton(action.down, action.button, action.isPlayer1);
             m_fields->isDispatchingBuffered = false;
         }
     }
@@ -935,8 +944,8 @@ class $modify(FrameAssistPlayLayer, PlayLayer) {
         CCLabelBMFont* hudLabel = nullptr;
     };
 
-    bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
-        if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
+    bool init(GJGameLevel* level, bool dontCreateObjects) {
+        if (!PlayLayer::init(level, dontCreateObjects)) return false;
 
         auto base = static_cast<FrameAssistGameLayer*>(static_cast<GJBaseGameLayer*>(this));
         base->resetAssistState();

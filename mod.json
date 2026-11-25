@@ -1,0 +1,73 @@
+{
+    "geode": "6.0.0",
+    "gd": {
+        "android": "2.2091"
+    },
+    "id": "tuusuario.frame_assist_mod",
+    "name": "Frame Assist Mod",
+    "version": "v1.0.0",
+    "developer": "TuNombre",
+    "description": "Lectura de frames en tiempo real con margen predictivo de clic y soltado por vehiculo.",
+    "settings": {
+        "mod-enabled": {
+            "type": "bool",
+            "name": "Activar Mod",
+            "description": "Interruptor principal del motor de asistencia de frames.",
+            "default": true
+        },
+        "margin-frames": {
+            "type": "int",
+            "name": "Margen de Espera (60 FPS)",
+            "description": "Maximo de frames que el mod espera para ejecutar un clic o soltado.",
+            "default": 16,
+            "min": 1,
+            "max": 30
+        },
+        "lookahead-frames": {
+            "type": "int",
+            "name": "Horizonte de Trayectoria",
+            "description": "Cuantos frames hacia adelante simula para detectar colisiones.",
+            "default": 24,
+            "min": 8,
+            "max": 45
+        },
+        "buffer-press": {
+            "type": "bool",
+            "name": "Asistir al Presionar",
+            "description": "Retiene el clic si hacerlo ahora provoca muerte o esta fuera de tiempo.",
+            "default": true
+        },
+        "buffer-release": {
+            "type": "bool",
+            "name": "Asistir al Soltar",
+            "description": "Retiene el soltado del clic hasta el frame seguro dentro del margen.",
+            "default": true
+        },
+        "safe-mode": {
+            "type": "bool",
+            "name": "Modo Seguro (Safe Mode)",
+            "description": "Evita guardar progreso o estrellas en servidores mientras el mod esta activo.",
+            "default": true
+        },
+        "show-hud": {
+            "type": "bool",
+            "name": "HUD de Frames en Nivel",
+            "description": "Muestra el frame actual (60 FPS), vehiculo y estado del bufer en tiempo real.",
+            "default": true
+        },
+        "enable-in-practice": {
+            "type": "bool",
+            "name": "Permitir en Practica",
+            "description": "Mantiene activo el analisis de frames en Modo Practica.",
+            "default": true
+        },
+        "ui-scale": {
+            "type": "float",
+            "name": "Escala del Panel",
+            "description": "Tamano del panel flotante en el menu principal.",
+            "default": 1.0,
+            "min": 0.7,
+            "max": 1.4
+        }
+    }
+}

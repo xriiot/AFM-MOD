@@ -2,8 +2,10 @@
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/MenuLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
+#include <Geode/modify/PlayerObject.hpp>
 #include <Geode/ui/Popup.hpp>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <deque>
@@ -16,6 +18,20 @@ using namespace geode::prelude;
 namespace {
 
 constexpr double REF_FPS = 60.0;
+constexpr double PHYS_TPS = 240.0;
+constexpr float TICK_DT_60 = 0.25f; // 1 tick a 240 TPS equivale a 0.25 frames a 60 FPS
+constexpr int TICKS_PER_FRAME60 = 4;
+constexpr double SEARCH_BUDGET_MS = 5.0; // Limite de tiempo por calculo para evitar lag a 120 FPS
+
+// Estado global de simulacion del jugador fantasma (solo corre en el hilo principal de Cocos2d)
+bool g_simulatingGhost = false;
+bool g_ghostDied = false;
+PlayerObject* g_ghostPrefix = nullptr;
+PlayerObject* g_ghostProbe = nullptr;
+
+inline bool isGhostPlayer(PlayerObject* p) {
+    return p != nullptr && (p == g_ghostPrefix || p == g_ghostProbe);
+}
 
 enum class VehicleMode {
     Cube,
@@ -28,39 +44,6 @@ enum class VehicleMode {
     Swing
 };
 
-enum class PadKind {
-    Yellow,
-    Pink,
-    Red,
-    Gravity
-};
-
-struct PadEntry {
-    CCRect rect;
-    PadKind kind;
-};
-
-struct PortalEntry {
-    CCRect rect;
-    bool toUpsideDown;
-};
-
-struct SimState {
-    float x = 0.f;
-    float y = 0.f;
-    float vxPerFrame = 5.193f; // px por frame de referencia (60 FPS)
-    float vy = 0.f;
-    float halfW = 15.f;
-    float halfH = 15.f;
-    float floorY = 0.f;
-    int robotBoostFrames = 0;
-    bool upsideDown = false;
-    bool onGround = false;
-    bool holding = false;
-    bool mini = false;
-    VehicleMode mode = VehicleMode::Cube;
-};
-
 struct PendingAction {
     bool down = false;
     int button = 1;
@@ -68,22 +51,27 @@ struct PendingAction {
     double createdTime = 0.0;
     double targetTime = 0.0;
     double expireTime = 0.0;
+    double lastRescanTime = 0.0;
     int targetFrame60 = 0;
     bool quickTapRelease = false;
 };
 
-struct SimOutcome {
+struct ProbeOutcome {
     bool survivedAll = true;
-    bool actionEffective = true;
-    int survivalFrames = 0;
-    float minClearance = 999.f;
+    bool effective = true;
+    int survivalTicks = 0;
 };
 
 struct DelayDecision {
-    int delay = 0;
+    int delayTicks = 0;
     bool fireNow = true;
-    float clearance = 0.f;
     const char* reason = "OK";
+};
+
+struct ActivationSnapshot {
+    GameObject* obj = nullptr;
+    bool activatedP1 = false;
+    bool activatedP2 = false;
 };
 
 VehicleMode detectVehicle(PlayerObject* player) {
@@ -127,396 +115,61 @@ const char* vehicleName(VehicleMode mode) {
     return "Cube";
 }
 
-bool isHazardObject(GameObject* obj) {
-    if (!obj) return false;
-    auto type = obj->m_objectType;
-    return type == GameObjectType::Hazard || type == GameObjectType::AnimatedHazard;
+bool isSpeedPortalID(int id) {
+    return id == 200 || id == 201 || id == 202 || id == 203 || id == 1334;
 }
 
-bool isOrbObject(GameObject* obj) {
+// Objetos de fisica que el fantasma SI puede activar (pads, orbes, portales de vehiculo/gravedad/tamano/velocidad)
+// Excluye triggers de nivel (Move, Toggle, Alpha, Spawn, SFX, End, Coins, Dual, Mirror, Teleport)
+bool isGhostInteractivePhysicsObject(GameObject* obj) {
     if (!obj) return false;
-    switch (obj->m_objectType) {
+    auto type = obj->m_objectType;
+    int rawType = static_cast<int>(type);
+
+    // SpiderPad (44) y GravityTogglePortal (42) por valor entero para maxima compatibilidad entre bindings
+    if (rawType == 42 || rawType == 44) return true;
+
+    switch (type) {
+        case GameObjectType::InverseGravityPortal:
+        case GameObjectType::NormalGravityPortal:
+        case GameObjectType::CubePortal:
+        case GameObjectType::ShipPortal:
+        case GameObjectType::BallPortal:
+        case GameObjectType::UfoPortal:
+        case GameObjectType::WavePortal:
+        case GameObjectType::RobotPortal:
+        case GameObjectType::SpiderPortal:
+        case GameObjectType::SwingPortal:
+        case GameObjectType::RegularSizePortal:
+        case GameObjectType::MiniSizePortal:
+        case GameObjectType::YellowJumpPad:
+        case GameObjectType::PinkJumpPad:
+        case GameObjectType::RedJumpPad:
+        case GameObjectType::GravityPad:
         case GameObjectType::YellowJumpRing:
         case GameObjectType::PinkJumpRing:
         case GameObjectType::RedJumpRing:
         case GameObjectType::GravityRing:
         case GameObjectType::GreenRing:
+        case GameObjectType::DropRing:
         case GameObjectType::DashRing:
         case GameObjectType::GravityDashRing:
-        case GameObjectType::DropRing:
         case GameObjectType::SpiderOrb:
             return true;
+        case GameObjectType::Modifier:
+            return isSpeedPortalID(obj->m_objectID);
         default:
             return false;
     }
 }
 
-bool isSolidObject(GameObject* obj) {
-    if (!obj) return false;
-    auto type = obj->m_objectType;
-    return type == GameObjectType::Solid || type == GameObjectType::Breakable;
-}
-
-bool isPadObject(GameObject* obj, PadKind& outKind) {
-    if (!obj) return false;
-    switch (obj->m_objectType) {
-        case GameObjectType::YellowJumpPad: outKind = PadKind::Yellow;  return true;
-        case GameObjectType::PinkJumpPad:   outKind = PadKind::Pink;    return true;
-        case GameObjectType::RedJumpPad:    outKind = PadKind::Red;     return true;
-        case GameObjectType::GravityPad:    outKind = PadKind::Gravity; return true;
-        default: return false;
-    }
-}
-
-bool isGravityPortalObject(GameObject* obj, bool& outUpsideDown) {
-    if (!obj) return false;
-    if (obj->m_objectType == GameObjectType::InverseGravityPortal) {
-        outUpsideDown = true;
-        return true;
-    }
-    if (obj->m_objectType == GameObjectType::NormalGravityPortal) {
-        outUpsideDown = false;
-        return true;
-    }
-    return false;
-}
-
-// Distancia entre dos rectangulos (<= 0 significa colision)
-float rectDistance(CCRect const& a, CCRect const& b) {
-    float dx = std::max(b.getMinX() - a.getMaxX(), a.getMinX() - b.getMaxX());
-    float dy = std::max(b.getMinY() - a.getMaxY(), a.getMinY() - b.getMaxY());
-    if (dx <= 0.f && dy <= 0.f) {
-        return std::max(dx, dy);
-    }
-    if (dx > 0.f && dy > 0.f) {
-        return std::hypot(dx, dy);
-    }
-    return std::max(dx, dy);
-}
-
-CCRect safeObjectRect(GameObject* obj, bool asHazard) {
-    CCRect r = obj->getObjectRect();
-    if (r.size.width <= 0.5f || r.size.height <= 0.5f) {
-        auto pos = obj->getPosition();
-        auto sz = obj->getScaledContentSize();
-        float w = sz.width > 1.f ? sz.width : 30.f;
-        float h = sz.height > 1.f ? sz.height : 30.f;
-        r = CCRect(pos.x - w * 0.5f, pos.y - h * 0.5f, w, h);
-    }
-
-    if (asHazard) {
-        // Si vino como tile completo de 30x30, ajustar a hitbox real de espina (~40% centro)
-        if (r.size.width > 24.f && r.size.height > 24.f) {
-            float padX = r.size.width * 0.25f;
-            float padY = r.size.height * 0.22f;
-            r = CCRect(
-                r.origin.x + padX,
-                r.origin.y + padY,
-                std::max(6.f, r.size.width - padX * 2.f),
-                std::max(6.f, r.size.height - padY * 2.f)
-            );
+void restoreSnapshots(std::vector<ActivationSnapshot> const& snapshots) {
+    for (auto const& snap : snapshots) {
+        if (snap.obj) {
+            snap.obj->m_hasBeenActivated = snap.activatedP1;
+            snap.obj->m_hasBeenActivatedP2 = snap.activatedP2;
         }
     }
-    return r;
-}
-
-float estimateVxFromSpeed(float playerSpeed) {
-    // Velocidades reales de GD en px por frame a 60 FPS
-    if (playerSpeed <= 0.75f) return 251.16f / 60.f; // 0.5x
-    if (playerSpeed <= 0.98f) return 311.58f / 60.f; // 1x
-    if (playerSpeed <= 1.20f) return 387.42f / 60.f; // 2x
-    if (playerSpeed <= 1.45f) return 468.00f / 60.f; // 3x
-    return 576.00f / 60.f;                           // 4x
-}
-
-SimState captureState(PlayerObject* p, bool isHolding, float measuredVx, float floorY) {
-    SimState s;
-    auto pos = p->getPosition();
-    auto rect = p->getObjectRect();
-    s.x = pos.x;
-    s.y = pos.y;
-    s.mini = p->m_vehicleSize < 0.8f;
-
-    float baseW = rect.size.width > 2.f ? rect.size.width : (s.mini ? 18.f : 30.f);
-    float baseH = rect.size.height > 2.f ? rect.size.height : (s.mini ? 18.f : 30.f);
-    s.halfW = std::clamp(baseW * 0.5f, 4.f, 15.f);
-    s.halfH = std::clamp(baseH * 0.5f, 4.f, 15.f);
-
-    if (measuredVx > 1.5f && measuredVx < 18.f) {
-        s.vxPerFrame = measuredVx;
-    } else {
-        float speedMult = p->m_playerSpeed > 0.1f ? p->m_playerSpeed : 0.9f;
-        s.vxPerFrame = estimateVxFromSpeed(speedMult);
-    }
-
-    s.vy = static_cast<float>(p->m_yVelocity);
-    s.upsideDown = p->m_isUpsideDown;
-    s.onGround = p->m_isOnGround;
-    s.holding = isHolding;
-    s.mode = detectVehicle(p);
-    s.floorY = floorY;
-    s.robotBoostFrames = 0;
-    return s;
-}
-
-// Avanza 1 frame de referencia (1/60 s) con integracion cinematica exacta de 2 subpasos (dt_gd = 0.9).
-// Devuelve true si choco fatalmente contra un bloque solido.
-bool stepVehicleOneFrame(
-    SimState& s,
-    bool justPressed,
-    bool justReleased,
-    bool touchingOrb,
-    const std::vector<CCRect>& solids,
-    const std::vector<PadEntry>& pads,
-    const std::vector<PortalEntry>& portals
-) {
-    float gravDir = s.upsideDown ? 1.f : -1.f;
-    float miniJumpScale = s.mini ? 0.8f : 1.0f;
-
-    if (justPressed) s.holding = true;
-    if (justReleased) {
-        s.holding = false;
-        s.robotBoostFrames = 0;
-    }
-
-    // Interaccion con orbe al presionar
-    if (justPressed && touchingOrb) {
-        s.vy = -gravDir * (11.180032f * miniJumpScale);
-        s.onGround = false;
-    }
-
-    // 2 subpasos por frame de 60 FPS -> dt_sub = 0.9 / 2 = 0.45
-    constexpr float DT_SUB = 0.45f;
-
-    for (int sub = 0; sub < 2; ++sub) {
-        bool subPressed = justPressed && (sub == 0);
-        bool subReleased = justReleased && (sub == 0);
-        gravDir = s.upsideDown ? 1.f : -1.f;
-
-        float acc = 0.f;
-        float dy = 0.f;
-        bool useKinematic = true;
-
-        switch (s.mode) {
-            case VehicleMode::Cube: {
-                if ((subPressed || s.holding) && s.onGround) {
-                    s.vy = -gravDir * (11.180032f * miniJumpScale);
-                    s.onGround = false;
-                }
-                acc = gravDir * 0.958199f;
-                break;
-            }
-            case VehicleMode::Ship: {
-                float shipScale = s.mini ? 1.18f : 1.0f;
-                acc = (s.holding ? (-gravDir * 0.43f) : (gravDir * 0.35f)) * shipScale;
-                break;
-            }
-            case VehicleMode::Ball: {
-                if (subPressed && s.onGround) {
-                    s.upsideDown = !s.upsideDown;
-                    gravDir = s.upsideDown ? 1.f : -1.f;
-                    s.vy = gravDir * 2.4f;
-                    s.onGround = false;
-                }
-                acc = gravDir * 0.575f;
-                break;
-            }
-            case VehicleMode::UFO: {
-                if (subPressed) {
-                    s.vy = -gravDir * (s.mini ? 7.2f : 9.0f);
-                    s.onGround = false;
-                }
-                acc = gravDir * 0.80f;
-                break;
-            }
-            case VehicleMode::Wave: {
-                float slope = s.mini ? 2.0f : 1.0f;
-                float dir = s.holding ? -gravDir : gravDir;
-                dy = dir * (s.vxPerFrame * 0.5f) * slope;
-                s.vy = dy / DT_SUB;
-                useKinematic = false;
-                break;
-            }
-            case VehicleMode::Robot: {
-                if (subPressed && s.onGround) {
-                    s.vy = -gravDir * (s.mini ? 6.6f : 8.2f);
-                    s.onGround = false;
-                    s.robotBoostFrames = 11;
-                }
-                if (s.holding && s.robotBoostFrames > 0) {
-                    acc = -gravDir * 0.32f;
-                    if (sub == 0) s.robotBoostFrames--;
-                } else {
-                    acc = gravDir * 0.958199f;
-                }
-                if (subReleased && (-gravDir * s.vy) > 3.f) {
-                    s.vy *= 0.6f;
-                }
-                break;
-            }
-            case VehicleMode::Spider: {
-                if (subPressed && s.onGround) {
-                    s.upsideDown = !s.upsideDown;
-                    gravDir = s.upsideDown ? 1.f : -1.f;
-                    float searchDir = gravDir;
-                    float bestY = s.y + searchDir * 150.f;
-                    float bestDist = 9999.f;
-                    for (auto const& box : solids) {
-                        if (s.x + s.halfW < box.getMinX() || s.x - s.halfW > box.getMaxX()) continue;
-                        if (searchDir > 0.f && box.getMinY() >= s.y) {
-                            float d = box.getMinY() - s.y;
-                            if (d < bestDist) {
-                                bestDist = d;
-                                bestY = box.getMinY() - s.halfH;
-                            }
-                        } else if (searchDir < 0.f && box.getMaxY() <= s.y) {
-                            float d = s.y - box.getMaxY();
-                            if (d < bestDist) {
-                                bestDist = d;
-                                bestY = box.getMaxY() + s.halfH;
-                            }
-                        }
-                    }
-                    if (!s.upsideDown && s.floorY <= s.y) {
-                        float d = s.y - s.floorY;
-                        if (d < bestDist) {
-                            bestY = s.floorY + s.halfH;
-                        }
-                    }
-                    s.y = bestY;
-                    s.vy = 0.f;
-                    s.onGround = true;
-                    dy = 0.f;
-                    useKinematic = false;
-                } else {
-                    acc = gravDir * 0.958199f;
-                }
-                break;
-            }
-            case VehicleMode::Swing: {
-                if (subPressed) {
-                    s.upsideDown = !s.upsideDown;
-                    gravDir = s.upsideDown ? 1.f : -1.f;
-                }
-                acc = gravDir * 0.48f;
-                break;
-            }
-        }
-
-        if (useKinematic) {
-            // Integracion cinematica de punto medio: exacta respecto a 240 TPS
-            float nextVy = s.vy + acc * DT_SUB;
-            float maxAbsVy = (s.mode == VehicleMode::Ship) ? (s.mini ? 9.5f : 8.0f) :
-                             (s.mode == VehicleMode::Swing) ? 8.5f : 15.f;
-            nextVy = std::clamp(nextVy, -maxAbsVy, maxAbsVy);
-            dy = 0.5f * (s.vy + nextVy) * DT_SUB;
-            s.vy = nextVy;
-        }
-
-        float prevY = s.y;
-        s.x += s.vxPerFrame * 0.5f;
-        s.y += dy;
-        s.onGround = false;
-
-        // Piso base detectado dinamicamente
-        if (!s.upsideDown && s.y - s.halfH <= s.floorY) {
-            s.y = s.floorY + s.halfH;
-            s.vy = 0.f;
-            s.onGround = true;
-        }
-
-        CCRect outerRect(s.x - s.halfW, s.y - s.halfH, s.halfW * 2.f, s.halfH * 2.f);
-
-        // Revisar portales de gravedad cercanos
-        for (auto const& portal : portals) {
-            if (outerRect.intersectsRect(portal.rect)) {
-                s.upsideDown = portal.toUpsideDown;
-            }
-        }
-
-        // Revisar pads de salto cercanos
-        for (auto const& pad : pads) {
-            if (outerRect.intersectsRect(pad.rect)) {
-                float gDir = s.upsideDown ? 1.f : -1.f;
-                switch (pad.kind) {
-                    case PadKind::Yellow:
-                        s.vy = -gDir * (15.2f * miniJumpScale);
-                        s.onGround = false;
-                        break;
-                    case PadKind::Pink:
-                        s.vy = -gDir * (10.6f * miniJumpScale);
-                        s.onGround = false;
-                        break;
-                    case PadKind::Red:
-                        s.vy = -gDir * (19.3f * miniJumpScale);
-                        s.onGround = false;
-                        break;
-                    case PadKind::Gravity:
-                        s.upsideDown = !s.upsideDown;
-                        s.vy = (s.upsideDown ? 1.f : -1.f) * 4.5f;
-                        s.onGround = false;
-                        break;
-                }
-            }
-        }
-
-        // Colisiones con bloques solidos:
-        // Hitbox exterior para aterrizar, hitbox interior azul (~32%) para choque frontal mortal (como GD real)
-        float inHW = s.halfW * 0.32f;
-        float inHH = s.halfH * 0.32f;
-        CCRect innerRect(s.x - inHW, s.y - inHH, inHW * 2.f, inHH * 2.f);
-
-        for (auto const& box : solids) {
-            if (!outerRect.intersectsRect(box)) continue;
-
-            if (s.mode == VehicleMode::Wave) {
-                if (innerRect.intersectsRect(box)) return true;
-                continue;
-            }
-
-            // Aterrizaje por arriba (gravedad normal)
-            if (!s.upsideDown && prevY - s.halfH >= box.getMaxY() - 10.f && dy <= 0.f) {
-                s.y = box.getMaxY() + s.halfH;
-                s.vy = 0.f;
-                s.onGround = true;
-                continue;
-            }
-            // Aterrizaje por abajo (gravedad invertida)
-            if (s.upsideDown && prevY + s.halfH <= box.getMinY() + 10.f && dy >= 0.f) {
-                s.y = box.getMinY() - s.halfH;
-                s.vy = 0.f;
-                s.onGround = true;
-                continue;
-            }
-
-            // Deslizamiento de techo/suelo en vehiculos que no mueren por rozar techo
-            bool canSlideCeiling = (
-                s.mode == VehicleMode::Ship ||
-                s.mode == VehicleMode::UFO ||
-                s.mode == VehicleMode::Ball ||
-                s.mode == VehicleMode::Swing
-            );
-            if (canSlideCeiling) {
-                if (!s.upsideDown && prevY + s.halfH <= box.getMinY() + 10.f && dy >= 0.f) {
-                    s.y = box.getMinY() - s.halfH;
-                    s.vy = 0.f;
-                    continue;
-                }
-                if (s.upsideDown && prevY - s.halfH >= box.getMaxY() - 10.f && dy <= 0.f) {
-                    s.y = box.getMaxY() + s.halfH;
-                    s.vy = 0.f;
-                    continue;
-                }
-            }
-
-            // Solo muere contra bloque si la hitbox interior azul penetra el solido
-            if (innerRect.intersectsRect(box)) {
-                return true;
-            }
-        }
-    }
-
-    return false;
 }
 
 } // namespace
@@ -556,7 +209,7 @@ protected:
         }
 
         m_onSettingsChanged = std::move(onSettingsChanged);
-        this->setTitle("Frame Assist - Configuracion");
+        this->setTitle("Frame Assist (Ghost) - Config");
 
         auto menu = CCMenu::create();
         menu->setPosition({0.f, 0.f});
@@ -749,7 +402,7 @@ protected:
         Mod::get()->setSettingValue<bool>("show-hud", true);
         Mod::get()->setSettingValue<bool>("enable-in-practice", true);
         Mod::get()->setSettingValue<int64_t>("margin-frames", 16);
-        Mod::get()->setSettingValue<int64_t>("lookahead-frames", 28);
+        Mod::get()->setSettingValue<int64_t>("lookahead-frames", 24);
         Mod::get()->setSettingValue<double>("ui-scale", 1.0);
 
         m_enabledToggle->toggle(true);
@@ -763,9 +416,9 @@ protected:
         m_marginSlider->updateBar();
         m_marginValLabel->setString("16f");
 
-        m_lookaheadSlider->setValue(static_cast<float>(28 - MIN_LOOKAHEAD) / (MAX_LOOKAHEAD - MIN_LOOKAHEAD));
+        m_lookaheadSlider->setValue(static_cast<float>(24 - MIN_LOOKAHEAD) / (MAX_LOOKAHEAD - MIN_LOOKAHEAD));
         m_lookaheadSlider->updateBar();
-        m_lookaheadValLabel->setString("28f");
+        m_lookaheadValLabel->setString("24f");
 
         m_scaleSlider->setValue((1.0f - MIN_SCALE) / (MAX_SCALE - MIN_SCALE));
         m_scaleSlider->updateBar();
@@ -820,7 +473,6 @@ class $modify(FrameAssistMenuLayer, MenuLayer) {
         panelMenu->setPosition({0.f, 0.f});
         panel->addChild(panelMenu);
 
-        // Interruptor rapido ON / OFF
         auto quickToggle = CCMenuItemToggler::createWithStandardSprites(
             this, menu_selector(FrameAssistMenuLayer::onQuickToggle), 0.65f
         );
@@ -828,7 +480,6 @@ class $modify(FrameAssistMenuLayer, MenuLayer) {
         panelMenu->addChild(quickToggle);
         m_fields->quickToggle = quickToggle;
 
-        // Area clicable para abrir ventana de configuracion
         auto clickArea = CCNode::create();
         clickArea->setContentSize({120.f, 38.f});
 
@@ -839,7 +490,7 @@ class $modify(FrameAssistMenuLayer, MenuLayer) {
         clickArea->addChild(statusLabel);
         m_fields->statusLabel = statusLabel;
 
-        auto infoLabel = CCLabelBMFont::create("Margen: 16f | Config", "goldFont.fnt");
+        auto infoLabel = CCLabelBMFont::create("Ghost 16f | Config", "goldFont.fnt");
         infoLabel->setAnchorPoint({0.f, 0.5f});
         infoLabel->setScale(0.31f);
         infoLabel->setPosition({2.f, 11.f});
@@ -874,7 +525,7 @@ class $modify(FrameAssistMenuLayer, MenuLayer) {
             m_fields->statusLabel->setColor(enabled ? ccColor3B{120, 255, 120} : ccColor3B{255, 110, 110});
         }
         if (m_fields->infoLabel) {
-            m_fields->infoLabel->setString(fmt::format("Margen: {}f | Config", margin).c_str());
+            m_fields->infoLabel->setString(fmt::format("Ghost {}f | Config", margin).c_str());
         }
         if (m_fields->panelContainer) {
             m_fields->panelContainer->setScale(std::clamp(scale, 0.7f, 1.4f));
@@ -896,7 +547,95 @@ class $modify(FrameAssistMenuLayer, MenuLayer) {
 };
 
 // ============================================================================
-// 3. MOTOR DE LECTURA DE FRAMES Y PREDICCION (GJBaseGameLayer + PlayLayer)
+// 3. AISLAMIENTO VISUAL Y DE EFECTOS DEL JUGADOR FANTASMA (PlayerObject)
+// Impide que los clones fantasmas generen particulas, estelas, sonido o saltos.
+// ============================================================================
+class $modify(GhostIsolatedPlayerObject, PlayerObject) {
+    void playDeathEffect() {
+        if (g_simulatingGhost || isGhostPlayer(this)) return;
+        PlayerObject::playDeathEffect();
+    }
+
+    void playSpawnEffect() {
+        if (g_simulatingGhost || isGhostPlayer(this)) return;
+        PlayerObject::playSpawnEffect();
+    }
+
+    void playBumpEffect(int p0, GameObject* p1) {
+        if (g_simulatingGhost || isGhostPlayer(this)) return;
+        PlayerObject::playBumpEffect(p0, p1);
+    }
+
+    void playSpiderDashEffect(CCPoint p0, CCPoint p1) {
+        if (g_simulatingGhost || isGhostPlayer(this)) return;
+        PlayerObject::playSpiderDashEffect(p0, p1);
+    }
+
+    void playDynamicSpiderRun() {
+        if (g_simulatingGhost || isGhostPlayer(this)) return;
+        PlayerObject::playDynamicSpiderRun();
+    }
+
+    void playCompleteEffect(bool p0, bool p1) {
+        if (g_simulatingGhost || isGhostPlayer(this)) return;
+        PlayerObject::playCompleteEffect(p0, p1);
+    }
+
+    void activateStreak() {
+        if (g_simulatingGhost || isGhostPlayer(this)) return;
+        PlayerObject::activateStreak();
+    }
+
+    void fadeOutStreak2(float p0) {
+        if (g_simulatingGhost || isGhostPlayer(this)) return;
+        PlayerObject::fadeOutStreak2(p0);
+    }
+
+    void createFadeOutDartStreak() {
+        if (g_simulatingGhost || isGhostPlayer(this)) return;
+        PlayerObject::createFadeOutDartStreak();
+    }
+
+    void spawnCircle() {
+        if (g_simulatingGhost || isGhostPlayer(this)) return;
+        PlayerObject::spawnCircle();
+    }
+
+    void spawnDualCircle() {
+        if (g_simulatingGhost || isGhostPlayer(this)) return;
+        PlayerObject::spawnDualCircle();
+    }
+
+    void spawnPortalCircle(ccColor3B p0, float p1) {
+        if (g_simulatingGhost || isGhostPlayer(this)) return;
+        PlayerObject::spawnPortalCircle(p0, p1);
+    }
+
+    void spawnScaleCircle() {
+        if (g_simulatingGhost || isGhostPlayer(this)) return;
+        PlayerObject::spawnScaleCircle();
+    }
+
+    void toggleGhostEffect(GhostType p0) {
+        if (g_simulatingGhost || isGhostPlayer(this)) return;
+        PlayerObject::toggleGhostEffect(p0);
+    }
+
+    void incrementJumps() {
+        if (g_simulatingGhost || isGhostPlayer(this)) return;
+        PlayerObject::incrementJumps();
+    }
+
+    void updateRotation(float p0) {
+        if (g_simulatingGhost || isGhostPlayer(this)) return;
+        PlayerObject::updateRotation(p0);
+    }
+};
+
+// ============================================================================
+// 4. MOTOR FANTASMA CON FISICA REAL DEL JUEGO (GJBaseGameLayer)
+// Usa 2 PlayerObject invisibles (prefijo + sonda) ejecutando PlayerObject::update
+// y GJBaseGameLayer::checkCollisions a 240 TPS reales.
 // ============================================================================
 class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
     struct Fields {
@@ -904,27 +643,97 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
         int currentFrame60 = 0;
         bool actualHolding = false;
         bool isDispatchingBuffered = false;
+        int savedInputsCount = 0;
+
+        CCLayer* ghostLayer = nullptr;
+        PlayerObject* prefixGhost = nullptr;
+        PlayerObject* probeGhost = nullptr;
+
         size_t cachedObjectCount = 0;
+        std::vector<GameObject*> interactiveObjects;
+
         std::deque<PendingAction> pendingQueue;
-
-        // Medicion real de velocidad horizontal (px por 1/60s) y piso base real
-        float lastPlayerX = 0.f;
-        bool hasLastX = false;
-        float measuredVxPerFrame = 0.f;
-        float detectedFloorY = 0.f;
-        bool hasDetectedFloor = false;
-
-        // Diagnostico en vivo para HUD
-        int lastDecisionDelay = 0;
-        std::string lastDecisionReason = "LISTO";
-
-        std::vector<GameObject*> hazards;
-        std::vector<GameObject*> solids;
-        std::vector<GameObject*> orbs;
-        std::vector<GameObject*> pads;
-        std::vector<GameObject*> gravPortals;
+        int lastDelayTicks = 0;
+        std::string lastReason = "LISTO";
     };
 
+    // --- Bloqueo estricto de efectos secundarios del nivel durante la simulacion ---
+    bool canBeActivatedByPlayer(PlayerObject* player, EffectGameObject* obj) {
+        if (g_simulatingGhost || isGhostPlayer(player)) {
+            return isGhostInteractivePhysicsObject(obj);
+        }
+        return GJBaseGameLayer::canBeActivatedByPlayer(player, obj);
+    }
+
+    void flipGravity(PlayerObject* player, bool flip, bool noEffects) {
+        if (g_simulatingGhost || isGhostPlayer(player)) {
+            GJBaseGameLayer::flipGravity(player, flip, true);
+            return;
+        }
+        GJBaseGameLayer::flipGravity(player, flip, noEffects);
+    }
+
+    void playerWillSwitchMode(PlayerObject* player, GameObject* obj) {
+        if (g_simulatingGhost || isGhostPlayer(player)) return;
+        GJBaseGameLayer::playerWillSwitchMode(player, obj);
+    }
+
+    void toggleGroup(int group, bool activate) {
+        if (g_simulatingGhost) return;
+        GJBaseGameLayer::toggleGroup(group, activate);
+    }
+
+    void pickupItem(EffectGameObject* obj) {
+        if (g_simulatingGhost) return;
+        GJBaseGameLayer::pickupItem(obj);
+    }
+
+    void checkpointActivated(CheckpointGameObject* obj) {
+        if (g_simulatingGhost) return;
+        GJBaseGameLayer::checkpointActivated(obj);
+    }
+
+    void applyTimeWarp(float scale) {
+        if (g_simulatingGhost) return;
+        GJBaseGameLayer::applyTimeWarp(scale);
+    }
+
+    void reverseDirection(EffectGameObject* obj) {
+        if (g_simulatingGhost) return;
+        GJBaseGameLayer::reverseDirection(obj);
+    }
+
+    void rotateGameplay(RotateGameplayGameObject* obj) {
+        if (g_simulatingGhost) return;
+        GJBaseGameLayer::rotateGameplay(obj);
+    }
+
+    void flipArt(bool flip) {
+        if (g_simulatingGhost) return;
+        GJBaseGameLayer::flipArt(flip);
+    }
+
+    void toggleGroundVisibility(bool vis) {
+        if (g_simulatingGhost) return;
+        GJBaseGameLayer::toggleGroundVisibility(vis);
+    }
+
+    void toggleMGVisibility(bool vis) {
+        if (g_simulatingGhost) return;
+        GJBaseGameLayer::toggleMGVisibility(vis);
+    }
+
+    void activatedAudioTrigger(SFXTriggerGameObject* obj) {
+        if (g_simulatingGhost) return;
+        GJBaseGameLayer::activatedAudioTrigger(obj);
+    }
+
+    void gameEventTriggered(GJGameEvent event, int a, int b) {
+        if (g_simulatingGhost) return;
+        GJBaseGameLayer::gameEventTriggered(event, a, b);
+    }
+
+    // --- Gestion del ciclo de vida de los jugadores fantasmas ---
     bool isAssistActive() {
         auto playLayer = PlayLayer::get();
         if (!playLayer || static_cast<GJBaseGameLayer*>(playLayer) != this) return false;
@@ -934,352 +743,453 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
         return true;
     }
 
-    void ensureSpatialCache() {
+    void ensureInteractiveCache() {
         if (!m_objects) return;
         size_t count = static_cast<size_t>(m_objects->count());
         if (count == 0 || count == m_fields->cachedObjectCount) return;
 
-        m_fields->hazards.clear();
-        m_fields->solids.clear();
-        m_fields->orbs.clear();
-        m_fields->pads.clear();
-        m_fields->gravPortals.clear();
-
+        m_fields->interactiveObjects.clear();
         for (auto* obj : CCArrayExt<GameObject*>(m_objects)) {
             if (!obj) continue;
-            PadKind padKind;
-            bool portalUpside = false;
-            if (isHazardObject(obj)) {
-                m_fields->hazards.push_back(obj);
-            } else if (isSolidObject(obj)) {
-                m_fields->solids.push_back(obj);
-            } else if (isOrbObject(obj)) {
-                m_fields->orbs.push_back(obj);
-            } else if (isPadObject(obj, padKind)) {
-                m_fields->pads.push_back(obj);
-            } else if (isGravityPortalObject(obj, portalUpside)) {
-                m_fields->gravPortals.push_back(obj);
+            if (isGhostInteractivePhysicsObject(obj)) {
+                m_fields->interactiveObjects.push_back(obj);
+            }
+        }
+        std::sort(
+            m_fields->interactiveObjects.begin(),
+            m_fields->interactiveObjects.end(),
+            [](GameObject* a, GameObject* b) {
+                return a->getPositionX() < b->getPositionX();
+            }
+        );
+        m_fields->cachedObjectCount = count;
+    }
+
+    bool ensureGhosts() {
+        if (m_fields->prefixGhost && m_fields->probeGhost) {
+            g_ghostPrefix = m_fields->prefixGhost;
+            g_ghostProbe = m_fields->probeGhost;
+            return true;
+        }
+        if (!m_player1 || !m_objectLayer) return false;
+
+        g_simulatingGhost = true;
+
+        if (!m_fields->ghostLayer) {
+            auto layer = CCLayer::create();
+            layer->setID("frame-assist-ghost-layer"_spr);
+            layer->setVisible(false);
+            m_objectLayer->addChild(layer, -100);
+            m_fields->ghostLayer = layer;
+        }
+
+        if (!m_fields->prefixGhost) {
+            auto g1 = PlayerObject::create(1, 1, this, m_fields->ghostLayer, false);
+            if (g1) {
+                g1->setVisible(false);
+                g1->setOpacity(0);
+                m_fields->ghostLayer->addChild(g1);
+                m_fields->prefixGhost = g1;
             }
         }
 
-        auto sortByX = [](GameObject* a, GameObject* b) {
-            return a->getPositionX() < b->getPositionX();
-        };
-        std::sort(m_fields->hazards.begin(), m_fields->hazards.end(), sortByX);
-        std::sort(m_fields->solids.begin(), m_fields->solids.end(), sortByX);
-        std::sort(m_fields->orbs.begin(), m_fields->orbs.end(), sortByX);
-        std::sort(m_fields->pads.begin(), m_fields->pads.end(), sortByX);
-        std::sort(m_fields->gravPortals.begin(), m_fields->gravPortals.end(), sortByX);
+        if (!m_fields->probeGhost) {
+            auto g2 = PlayerObject::create(1, 1, this, m_fields->ghostLayer, false);
+            if (g2) {
+                g2->setVisible(false);
+                g2->setOpacity(0);
+                m_fields->ghostLayer->addChild(g2);
+                m_fields->probeGhost = g2;
+            }
+        }
 
-        m_fields->cachedObjectCount = count;
+        g_ghostPrefix = m_fields->prefixGhost;
+        g_ghostProbe = m_fields->probeGhost;
+        g_simulatingGhost = false;
+
+        return m_fields->prefixGhost != nullptr && m_fields->probeGhost != nullptr;
+    }
+
+    void teardownGhosts() {
+        g_simulatingGhost = false;
+        g_ghostDied = false;
+        g_ghostPrefix = nullptr;
+        g_ghostProbe = nullptr;
+        m_fields->prefixGhost = nullptr;
+        m_fields->probeGhost = nullptr;
+        m_fields->ghostLayer = nullptr;
+        m_fields->pendingQueue.clear();
     }
 
     void resetAssistState() {
         m_fields->elapsedTime = 0.0;
         m_fields->currentFrame60 = 0;
         m_fields->actualHolding = false;
+        m_fields->savedInputsCount = 0;
         m_fields->pendingQueue.clear();
-        m_fields->hasLastX = false;
-        m_fields->measuredVxPerFrame = 0.f;
-        m_fields->detectedFloorY = 0.f;
-        m_fields->hasDetectedFloor = false;
-        m_fields->lastDecisionDelay = 0;
-        m_fields->lastDecisionReason = "LISTO";
+        m_fields->lastDelayTicks = 0;
+        m_fields->lastReason = "LISTO";
+
+        if (m_fields->prefixGhost && m_fields->probeGhost) {
+            g_simulatingGhost = true;
+            m_fields->prefixGhost->resetObject();
+            m_fields->probeGhost->resetObject();
+            m_fields->prefixGhost->setVisible(false);
+            m_fields->probeGhost->setVisible(false);
+            g_simulatingGhost = false;
+        }
     }
 
-    void updateDetectedFloor() {
-        if (!m_player1 || !m_player1->m_isOnGround || m_player1->m_isUpsideDown) return;
+    void clearPendingQueue() {
+        m_fields->pendingQueue.clear();
+    }
 
-        auto pos = m_player1->getPosition();
-        auto rect = m_player1->getObjectRect();
-        bool mini = m_player1->m_vehicleSize < 0.8f;
-        float halfW = std::clamp((rect.size.width > 2.f ? rect.size.width : (mini ? 18.f : 30.f)) * 0.5f, 4.f, 15.f);
-        float halfH = std::clamp((rect.size.height > 2.f ? rect.size.height : (mini ? 18.f : 30.f)) * 0.5f, 4.f, 15.f);
-        float feetY = pos.y - halfH;
-
-        // Comprobar si esta parado sobre un bloque solido
-        bool standingOnSolid = false;
+    void snapshotNearbyInteractive(float minX, float maxX, std::vector<ActivationSnapshot>& out) {
+        out.clear();
         auto it = std::lower_bound(
-            m_fields->solids.begin(), m_fields->solids.end(), pos.x - 45.f,
+            m_fields->interactiveObjects.begin(),
+            m_fields->interactiveObjects.end(),
+            minX,
             [](GameObject* obj, float x) { return obj->getPositionX() < x; }
         );
-        for (; it != m_fields->solids.end(); ++it) {
+        for (; it != m_fields->interactiveObjects.end(); ++it) {
             GameObject* obj = *it;
-            if (obj->getPositionX() > pos.x + 45.f) break;
-            if (obj->m_isDisabled) continue;
-            CCRect r = safeObjectRect(obj, false);
-            if (pos.x + halfW >= r.getMinX() - 2.f &&
-                pos.x - halfW <= r.getMaxX() + 2.f &&
-                std::fabs(r.getMaxY() - feetY) <= 8.f) {
-                standingOnSolid = true;
+            if (obj->getPositionX() > maxX) break;
+            out.push_back({obj, obj->m_hasBeenActivated, obj->m_hasBeenActivatedP2});
+        }
+    }
+
+    void syncGhostFrom(PlayerObject* dst, PlayerObject* src) {
+        dst->m_isDead = false;
+        dst->resetTouchedRings(true);
+        dst->copyAttributes(src);
+        auto pos = src->getPosition();
+        dst->m_position = pos;
+        dst->setPosition(pos);
+        dst->setVisible(false);
+        dst->setOpacity(0);
+    }
+
+    // Avanza un PlayerObject fantasma exactamente 1 tick real de GD (1/240 s)
+    bool stepGhostOneTick(PlayerObject* ghost) {
+        g_ghostDied = false;
+        ghost->update(TICK_DT_60);
+        if (g_ghostDied || ghost->m_isDead) return false;
+        this->checkCollisions(ghost, TICK_DT_60, false);
+        if (g_ghostDied || ghost->m_isDead) return false;
+        return true;
+    }
+
+    // Simula una sonda a partir del estado actual de `baseGhost` aplicando `actionDown` de inmediato
+    ProbeOutcome runProbeFromBase(
+        PlayerObject* baseGhost,
+        bool actionDown,
+        int lookaheadTicks,
+        std::vector<ActivationSnapshot> const& snapshots
+    ) {
+        auto* probe = m_fields->probeGhost;
+        ProbeOutcome out;
+        out.survivedAll = true;
+        out.effective = true;
+        out.survivalTicks = lookaheadTicks;
+
+        syncGhostFrom(probe, baseGhost);
+
+        VehicleMode modeBefore = detectVehicle(probe);
+        bool onGroundBefore = probe->m_isOnGround;
+        bool upsideBefore = probe->m_isUpsideDown;
+        double vyBefore = probe->m_yVelocity;
+
+        if (actionDown) {
+            // Sincronizar anillos/orbes en contacto justo antes de pulsar el boton
+            g_ghostDied = false;
+            this->checkCollisions(probe, 0.0f, false);
+            if (g_ghostDied || probe->m_isDead) {
+                restoreSnapshots(snapshots);
+                return {false, false, 0};
+            }
+
+            probe->releaseButton(PlayerButton::Jump);
+            probe->pushButton(PlayerButton::Jump);
+        } else {
+            probe->releaseButton(PlayerButton::Jump);
+        }
+
+        // Verificar si el clic tuvo efecto real (en tierra, cambio de velocidad/gravedad o vehiculo aereo)
+        if (actionDown && isGroundVehicle(modeBefore) && !onGroundBefore) {
+            bool vyChanged = std::fabs(probe->m_yVelocity - vyBefore) > 1.0;
+            bool gravChanged = (probe->m_isUpsideDown != upsideBefore);
+            if (!vyChanged && !gravChanged) {
+                out.effective = false;
+            }
+        }
+
+        bool simulateQuickTapRelease = actionDown && isTapVehicle(modeBefore);
+
+        for (int t = 1; t <= lookaheadTicks; ++t) {
+            // Para vehiculos de toque (Cube/Ball/UFO/Spider/Swing), soltar 4 ticks (1f @ 60fps) despues
+            // para que un toque no genere saltos automaticos indeseados en la simulacion
+            if (simulateQuickTapRelease && t == 5) {
+                probe->releaseButton(PlayerButton::Jump);
+            }
+
+            if (!stepGhostOneTick(probe)) {
+                out.survivedAll = false;
+                out.survivalTicks = t;
+                restoreSnapshots(snapshots);
+                return out;
+            }
+
+            // Si en los primeros 2 ticks un orbe o dash se activo por el buffer interno del juego
+            if (actionDown && !out.effective && t <= 2) {
+                if (std::fabs(probe->m_yVelocity - vyBefore) > 2.5 ||
+                    probe->m_isUpsideDown != upsideBefore) {
+                    out.effective = true;
+                }
+            }
+        }
+
+        restoreSnapshots(snapshots);
+        return out;
+    }
+
+    int computeLookaheadTicks(VehicleMode mode, int lookaheadFramesSetting) {
+        int ticks = std::clamp(lookaheadFramesSetting, 8, 45) * TICKS_PER_FRAME60;
+        if (mode == VehicleMode::Cube || mode == VehicleMode::Robot) {
+            // Un salto completo de cubo dura ~100 ticks (25 frames @ 60fps)
+            return std::max(ticks, 104);
+        }
+        if (mode == VehicleMode::Wave || mode == VehicleMode::Ship) {
+            return std::clamp(ticks, 56, 120);
+        }
+        return std::max(ticks, 80);
+    }
+
+    // Evaluacion rapida en vivo mientras una accion espera en la cola (solo 2 sondas: d=0 y d=2)
+    bool evaluateLiveTrigger(bool actionDown, int lookaheadFramesSetting, bool& outNowSafe, bool& outNextSafe) {
+        outNowSafe = false;
+        outNextSafe = false;
+        if (!ensureGhosts()) return false;
+        ensureInteractiveCache();
+
+        VehicleMode mode = detectVehicle(m_player1);
+        int lookaheadTicks = computeLookaheadTicks(mode, lookaheadFramesSetting);
+
+        float px = m_player1->getPositionX();
+        std::vector<ActivationSnapshot> snapshots;
+        snapshotNearbyInteractive(px - 90.f, px + 750.f, snapshots);
+
+        g_simulatingGhost = true;
+
+        auto* prefix = m_fields->prefixGhost;
+        syncGhostFrom(prefix, m_player1);
+        if (actionDown) {
+            prefix->releaseButton(PlayerButton::Jump);
+        } else {
+            if (mode == VehicleMode::Ship || mode == VehicleMode::Wave ||
+                mode == VehicleMode::Robot || !prefix->m_isOnGround) {
+                prefix->pushButton(PlayerButton::Jump);
+            }
+        }
+
+        // Sonda 1: disparar YA (d = 0)
+        ProbeOutcome nowOut = runProbeFromBase(prefix, actionDown, lookaheadTicks, snapshots);
+        outNowSafe = nowOut.survivedAll && nowOut.effective;
+
+        // Sonda 2: esperar 2 ticks mas (1 frame @ 120fps)
+        bool prefixAlive = true;
+        for (int s = 0; s < 2; ++s) {
+            if (!stepGhostOneTick(prefix)) {
+                prefixAlive = false;
                 break;
             }
         }
-
-        // Si esta en el suelo sin bloque debajo, esta es la altura real del piso del nivel
-        if (!standingOnSolid) {
-            m_fields->detectedFloorY = feetY;
-            m_fields->hasDetectedFloor = true;
+        if (prefixAlive) {
+            // Guardar snapshots acumulados del prefijo sin afectar al mundo real
+            ProbeOutcome nextOut = runProbeFromBase(prefix, actionDown, lookaheadTicks, snapshots);
+            outNextSafe = nextOut.survivedAll && nextOut.effective;
+        } else {
+            outNextSafe = false;
         }
+
+        restoreSnapshots(snapshots);
+        g_simulatingGhost = false;
+        return true;
     }
 
-    void gatherNearbyRects(
-        std::vector<GameObject*> const& list,
-        float minX,
-        float maxX,
-        std::vector<CCRect>& out,
-        bool asHazard
-    ) {
-        out.clear();
-        auto it = std::lower_bound(
-            list.begin(), list.end(), minX,
-            [](GameObject* obj, float x) { return obj->getPositionX() < x; }
-        );
-        for (; it != list.end(); ++it) {
-            GameObject* obj = *it;
-            if (obj->getPositionX() > maxX) break;
-            if (obj->m_isDisabled) continue;
-            out.push_back(safeObjectRect(obj, asHazard));
-        }
-    }
-
-    void gatherNearbyPads(float minX, float maxX, std::vector<PadEntry>& out) {
-        out.clear();
-        auto it = std::lower_bound(
-            m_fields->pads.begin(), m_fields->pads.end(), minX,
-            [](GameObject* obj, float x) { return obj->getPositionX() < x; }
-        );
-        for (; it != m_fields->pads.end(); ++it) {
-            GameObject* obj = *it;
-            if (obj->getPositionX() > maxX) break;
-            if (obj->m_isDisabled) continue;
-            PadKind kind;
-            if (isPadObject(obj, kind)) {
-                out.push_back({safeObjectRect(obj, false), kind});
-            }
-        }
-    }
-
-    void gatherNearbyPortals(float minX, float maxX, std::vector<PortalEntry>& out) {
-        out.clear();
-        auto it = std::lower_bound(
-            m_fields->gravPortals.begin(), m_fields->gravPortals.end(), minX,
-            [](GameObject* obj, float x) { return obj->getPositionX() < x; }
-        );
-        for (; it != m_fields->gravPortals.end(); ++it) {
-            GameObject* obj = *it;
-            if (obj->getPositionX() > maxX) break;
-            if (obj->m_isDisabled) continue;
-            bool upside = false;
-            if (isGravityPortalObject(obj, upside)) {
-                out.push_back({safeObjectRect(obj, false), upside});
-            }
-        }
-    }
-
-    // Simula la trayectoria y calcula supervivencia + holgura minima (en px) frente a peligros
-    SimOutcome simulateTrajectory(
-        SimState initial,
+    // Busqueda completa con jugador fantasma en [0 .. maxDelayTicks] (paso = 2 ticks = 120 FPS)
+    DelayDecision findBestGhostDelay(
         bool actionDown,
-        int delayFrames,
-        int commonHorizon,
-        std::vector<CCRect> const& nearHazards,
-        std::vector<CCRect> const& nearSolids,
-        std::vector<CCRect> const& nearOrbs,
-        std::vector<PadEntry> const& nearPads,
-        std::vector<PortalEntry> const& nearPortals
+        int maxDelayTicks,
+        int lookaheadFramesSetting,
+        bool isAlreadyBuffered
     ) {
-        SimState s = initial;
-        SimOutcome result;
-        result.survivedAll = true;
-        result.actionEffective = true;
-        result.survivalFrames = commonHorizon;
-        result.minClearance = 999.f;
+        if (!ensureGhosts()) {
+            return {0, true, "NO_GHOST"};
+        }
+        ensureInteractiveCache();
 
-        bool tapMode = actionDown && isTapVehicle(s.mode);
+        VehicleMode mode = detectVehicle(m_player1);
+        int lookaheadTicks = computeLookaheadTicks(mode, lookaheadFramesSetting);
+        int clampedMax = std::clamp(maxDelayTicks, 0, 120);
 
-        for (int f = 0; f <= commonHorizon; ++f) {
-            bool justPressed = (f == delayFrames && actionDown);
-            bool justReleased = (f == delayFrames && !actionDown);
+        float px = m_player1->getPositionX();
+        std::vector<ActivationSnapshot> snapshots;
+        snapshotNearbyInteractive(px - 90.f, px + 850.f, snapshots);
 
-            if (tapMode && f == delayFrames + 2) {
-                justReleased = true;
+        auto startClock = std::chrono::steady_clock::now();
+        g_simulatingGhost = true;
+
+        auto* prefix = m_fields->prefixGhost;
+        syncGhostFrom(prefix, m_player1);
+
+        // Configurar estado de retencion del prefijo (esperando sin ejecutar la nueva accion)
+        if (actionDown) {
+            prefix->releaseButton(PlayerButton::Jump);
+        } else {
+            if (mode == VehicleMode::Ship || mode == VehicleMode::Wave ||
+                mode == VehicleMode::Robot || !prefix->m_isOnGround) {
+                prefix->pushButton(PlayerButton::Jump);
+            }
+        }
+
+        // Evaluar d = 0 (ejecutar de inmediato)
+        ProbeOutcome nowOut = runProbeFromBase(prefix, actionDown, lookaheadTicks, snapshots);
+        if (!isAlreadyBuffered && nowOut.survivedAll && nowOut.effective) {
+            restoreSnapshots(snapshots);
+            g_simulatingGhost = false;
+            return {0, true, "SAFE0"};
+        }
+
+        struct CandResult {
+            int delayTicks;
+            ProbeOutcome out;
+        };
+        std::vector<CandResult> results;
+        results.reserve(static_cast<size_t>(clampedMax / 2 + 2));
+        results.push_back({0, nowOut});
+
+        // Paso de 2 ticks (120 FPS de resolucion real)
+        constexpr int STEP_TICKS = 2;
+
+        // Mantener snapshots propios para lo que active el prefijo al avanzar
+        std::vector<ActivationSnapshot> prefixStateSnaps = snapshots;
+
+        for (int d = STEP_TICKS; d <= clampedMax; d += STEP_TICKS) {
+            // Verificar presupuesto de tiempo para mantener 120 FPS fluidos en Android
+            auto nowClock = std::chrono::steady_clock::now();
+            double elapsedMs = std::chrono::duration<double, std::milli>(nowClock - startClock).count();
+            if (elapsedMs >= SEARCH_BUDGET_MS) {
+                break;
             }
 
-            CCRect pRect(s.x - s.halfW, s.y - s.halfH, s.halfW * 2.f, s.halfH * 2.f);
-            bool touchingOrb = false;
-            for (auto const& orb : nearOrbs) {
-                if (pRect.intersectsRect(orb)) {
-                    touchingOrb = true;
+            // Restaurar el estado que tenia el nivel en el ultimo punto del prefijo
+            restoreSnapshots(prefixStateSnaps);
+
+            bool prefixAlive = true;
+            for (int s = 0; s < STEP_TICKS; ++s) {
+                if (!stepGhostOneTick(prefix)) {
+                    prefixAlive = false;
                     break;
                 }
             }
-
-            if (justPressed && !touchingOrb && !s.onGround && isGroundVehicle(s.mode)) {
-                result.actionEffective = false;
+            if (!prefixAlive) {
+                // El jugador fantasma murio mientras esperaba: no tiene sentido esperar mas
+                break;
             }
 
-            bool crashedSolid = stepVehicleOneFrame(
-                s, justPressed, justReleased, touchingOrb, nearSolids, nearPads, nearPortals
-            );
-            if (crashedSolid) {
-                result.survivedAll = false;
-                result.survivalFrames = f;
-                result.minClearance = -10.f;
-                return result;
-            }
-
-            CCRect hazardCheckRect(s.x - s.halfW, s.y - s.halfH, s.halfW * 2.f, s.halfH * 2.f);
-            for (auto const& hz : nearHazards) {
-                float d = rectDistance(hazardCheckRect, hz);
-                if (d <= 0.f) {
-                    result.survivedAll = false;
-                    result.survivalFrames = f;
-                    result.minClearance = d;
-                    return result;
-                }
-                if (d < result.minClearance) {
-                    result.minClearance = d;
+            // Actualizar snapshot del prefijo actual para restaurar tras la sonda
+            for (auto& snap : prefixStateSnaps) {
+                if (snap.obj) {
+                    snap.activatedP1 = snap.obj->m_hasBeenActivated;
+                    snap.activatedP2 = snap.obj->m_hasBeenActivatedP2;
                 }
             }
-        }
-        return result;
-    }
 
-    // Evalua [0 .. marginFrames] y elige el punto optimo (centro + maxima holgura) de la ventana segura
-    DelayDecision findBestDelayFrame(
-        bool actionDown,
-        int marginFrames,
-        int lookaheadFrames,
-        bool isAlreadyBuffered
-    ) {
-        ensureSpatialCache();
-        updateDetectedFloor();
-
-        float floorY = m_fields->hasDetectedFloor ? m_fields->detectedFloorY : 0.f;
-        SimState initial = captureState(m_player1, m_fields->actualHolding, m_fields->measuredVxPerFrame, floorY);
-
-        int clampedMargin = std::max(0, marginFrames);
-        int commonHorizon = clampedMargin + std::max(lookaheadFrames, 26);
-        float maxDist = initial.vxPerFrame * static_cast<float>(commonHorizon + 14);
-        float minX = initial.x - 60.f;
-        float maxX = initial.x + maxDist;
-
-        std::vector<CCRect> nearHazards;
-        std::vector<CCRect> nearSolids;
-        std::vector<CCRect> nearOrbs;
-        std::vector<PadEntry> nearPads;
-        std::vector<PortalEntry> nearPortals;
-        gatherNearbyRects(m_fields->hazards, minX, maxX, nearHazards, true);
-        gatherNearbyRects(m_fields->solids, minX, maxX, nearSolids, false);
-        gatherNearbyRects(m_fields->orbs, minX, maxX, nearOrbs, false);
-        gatherNearbyPads(minX, maxX, nearPads);
-        gatherNearbyPortals(minX, maxX, nearPortals);
-
-        if (nearHazards.empty() && nearSolids.empty() && nearOrbs.empty()) {
-            return {0, true, 999.f, "LIBRE"};
+            ProbeOutcome probeOut = runProbeFromBase(prefix, actionDown, lookaheadTicks, prefixStateSnaps);
+            results.push_back({d, probeOut});
         }
 
-        // Evaluar TODOS los retrasos [0 .. clampedMargin]
-        std::vector<SimOutcome> outcomes;
-        outcomes.reserve(static_cast<size_t>(clampedMargin + 1));
-        for (int d = 0; d <= clampedMargin; ++d) {
-            outcomes.push_back(simulateTrajectory(
-                initial, actionDown, d, commonHorizon,
-                nearHazards, nearSolids, nearOrbs, nearPads, nearPortals
-            ));
-        }
+        // Restaurar SIEMPRE el estado original de todos los pads/orbes/portales del mundo real
+        restoreSnapshots(snapshots);
+        g_simulatingGhost = false;
 
-        auto const& nowOut = outcomes[0];
-
-        // Si es un toque nuevo (aun no retenido) y ejecutar YA tiene amplia holgura (>= 6 px), disparar al instante
-        if (!isAlreadyBuffered && nowOut.survivedAll && nowOut.actionEffective && nowOut.minClearance >= 6.f) {
-            return {0, true, nowOut.minClearance, "SAFE0"};
-        }
-
-        // Buscar la ventana contigua mas amplia de frames seguros y efectivos
-        int bestWinStart = -1;
-        int bestWinEnd = -1;
+        // Buscar la ventana contigua mas amplia de ticks seguros y efectivos
+        int bestStartIdx = -1;
+        int bestEndIdx = -1;
         int bestWinLen = 0;
-        float bestWinMaxClear = -1.f;
 
+        int n = static_cast<int>(results.size());
         int i = 0;
-        while (i <= clampedMargin) {
-            if (outcomes[i].survivedAll && outcomes[i].actionEffective) {
+        while (i < n) {
+            if (results[i].out.survivedAll && results[i].out.effective) {
                 int start = i;
-                float maxClear = outcomes[i].minClearance;
-                while (i + 1 <= clampedMargin &&
-                       outcomes[i + 1].survivedAll &&
-                       outcomes[i + 1].actionEffective) {
+                while (i + 1 < n && results[i + 1].out.survivedAll && results[i + 1].out.effective) {
                     i++;
-                    maxClear = std::max(maxClear, outcomes[i].minClearance);
                 }
                 int end = i;
                 int len = end - start + 1;
-                if (len > bestWinLen || (len == bestWinLen && maxClear > bestWinMaxClear)) {
+                if (len > bestWinLen) {
                     bestWinLen = len;
-                    bestWinMaxClear = maxClear;
-                    bestWinStart = start;
-                    bestWinEnd = end;
+                    bestStartIdx = start;
+                    bestEndIdx = end;
                 }
             }
             i++;
         }
 
-        if (bestWinStart >= 0) {
-            // Elegir el punto optimo dentro de la ventana combinando centro y holgura real
-            float center = 0.5f * static_cast<float>(bestWinStart + bestWinEnd);
-            int bestD = bestWinStart;
-            float bestScore = -1e9f;
-            for (int d = bestWinStart; d <= bestWinEnd; ++d) {
-                float c = std::min(outcomes[d].minClearance, 25.f);
-                float distFromCenter = std::fabs(static_cast<float>(d) - center);
-                float score = c * 2.0f - distFromCenter * 1.6f;
-                if (score > bestScore) {
-                    bestScore = score;
-                    bestD = d;
+        if (bestStartIdx >= 0) {
+            int chosenIdx = bestStartIdx;
+            if (actionDown && isTapVehicle(mode)) {
+                // En vehiculos de toque: apuntar al centro de la ventana segura
+                chosenIdx = (bestStartIdx + bestEndIdx) / 2;
+            } else {
+                // En Wave/Ship/Robot o soltados: elegir inicio seguro + pequeno colchon (1 paso = 2 ticks)
+                if (bestEndIdx - bestStartIdx >= 2) {
+                    chosenIdx = bestStartIdx + 1;
+                } else {
+                    chosenIdx = bestStartIdx;
                 }
             }
 
-            // Si ya estabamos esperando: disparar en cuanto alcanzamos el punto optimo (bestD == 0)
-            // O si esperar 1 frame mas ya provocaria muerte (ultimo frame seguro de la ventana)
-            if (isAlreadyBuffered && nowOut.survivedAll && nowOut.actionEffective) {
-                bool nextUnsafe = (clampedMargin >= 1 && !outcomes[1].survivedAll);
-                if (bestD == 0 || nextUnsafe) {
-                    return {0, true, nowOut.minClearance, "OPTIMO"};
+            int chosenDelay = results[chosenIdx].delayTicks;
+            if (isAlreadyBuffered && nowOut.survivedAll && nowOut.effective) {
+                bool nextUnsafe = (n > 1 && !results[1].out.survivedAll);
+                if (chosenDelay == 0 || nextUnsafe) {
+                    return {0, true, "GHOST_OK"};
                 }
             }
-
-            return {bestD, bestD == 0, outcomes[bestD].minClearance, "CENTRO"};
+            return {chosenDelay, chosenDelay == 0, "GHOST_WIN"};
         }
 
-        // Respaldo 1: primer delay que sobrevive todo el horizonte (aunque no sea efectivo en el aire)
-        for (int d = 1; d <= clampedMargin; ++d) {
-            if (outcomes[d].survivedAll) {
-                return {d, false, outcomes[d].minClearance, "ESQUIVA"};
+        // Respaldo 1: algun retraso sobrevive todo el horizonte (aunque no sea efectivo en el aire)
+        for (int idx = 1; idx < n; ++idx) {
+            if (results[idx].out.survivedAll) {
+                return {results[idx].delayTicks, false, "ESQUIVA"};
             }
         }
 
-        // Respaldo 2: retraso que maximiza los frames de supervivencia cuando hay otro obstaculo adelante
+        // Respaldo 2: hay un segundo obstaculo dentro del horizonte; elegir el delay que sobrevive mas
         int bestSurvDelay = 0;
-        int bestSurvFrames = nowOut.survivalFrames;
-        bool bestSurvEff = nowOut.actionEffective;
-        for (int d = 1; d <= clampedMargin; ++d) {
-            bool better = (outcomes[d].survivalFrames > bestSurvFrames) ||
-                          (outcomes[d].survivalFrames == bestSurvFrames &&
-                           outcomes[d].actionEffective && !bestSurvEff);
+        int bestSurvTicks = nowOut.survivalTicks;
+        bool bestSurvEff = nowOut.effective;
+        for (int idx = 1; idx < n; ++idx) {
+            auto const& cand = results[idx];
+            bool better = (cand.out.survivalTicks > bestSurvTicks) ||
+                          (cand.out.survivalTicks == bestSurvTicks &&
+                           cand.out.effective && !bestSurvEff);
             if (better) {
-                bestSurvFrames = outcomes[d].survivalFrames;
-                bestSurvDelay = d;
-                bestSurvEff = outcomes[d].actionEffective;
+                bestSurvTicks = cand.out.survivalTicks;
+                bestSurvDelay = cand.delayTicks;
+                bestSurvEff = cand.out.effective;
             }
         }
 
-        if (bestSurvDelay > 0 && bestSurvFrames >= nowOut.survivalFrames + 2) {
-            return {bestSurvDelay, false, outcomes[bestSurvDelay].minClearance, "SUPERV"};
+        if (bestSurvDelay > 0 && bestSurvTicks >= nowOut.survivalTicks + 8) {
+            return {bestSurvDelay, false, "SUPERV"};
         }
 
-        return {0, true, nowOut.minClearance, "SIN_ALT"};
+        return {0, true, "SIN_ALT"};
     }
 
     void dispatchButton(bool down, int button, bool isPlayer1) {
@@ -1290,11 +1200,12 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
     }
 
     void handleButton(bool down, int button, bool isPlayer1) {
-        if (m_fields->isDispatchingBuffered) {
+        if (m_fields->isDispatchingBuffered || g_simulatingGhost) {
             dispatchButton(down, button, isPlayer1);
             return;
         }
 
+        // Sin filtro de isPlayer1 para funcionar igual tocando izquierda o derecha en Android
         if ((button != 1 && button != 0) || !isAssistActive()) {
             dispatchButton(down, button, isPlayer1);
             return;
@@ -1302,9 +1213,10 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
 
         bool assistPress = Mod::get()->getSettingValue<bool>("buffer-press");
         bool assistRelease = Mod::get()->getSettingValue<bool>("buffer-release");
-        int margin = static_cast<int>(Mod::get()->getSettingValue<int64_t>("margin-frames"));
-        int lookahead = static_cast<int>(Mod::get()->getSettingValue<int64_t>("lookahead-frames"));
-        double marginSec = static_cast<double>(margin) / REF_FPS;
+        int marginFrames = static_cast<int>(Mod::get()->getSettingValue<int64_t>("margin-frames"));
+        int lookaheadFrames = static_cast<int>(Mod::get()->getSettingValue<int64_t>("lookahead-frames"));
+        int maxDelayTicks = marginFrames * TICKS_PER_FRAME60;
+        double marginSec = static_cast<double>(maxDelayTicks) / PHYS_TPS;
 
         // Toque rapido en Android: encolar SOLTAR detras del CLIC pendiente para no cancelarlo
         if (!down && !m_fields->pendingQueue.empty() && m_fields->pendingQueue.front().down) {
@@ -1314,8 +1226,9 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
                 rel.button = button;
                 rel.isPlayer1 = isPlayer1;
                 rel.createdTime = m_fields->elapsedTime;
-                rel.targetTime = m_fields->pendingQueue.front().targetTime + (2.0 / REF_FPS);
+                rel.targetTime = m_fields->pendingQueue.front().targetTime + (4.0 / PHYS_TPS);
                 rel.expireTime = m_fields->pendingQueue.front().expireTime + marginSec;
+                rel.lastRescanTime = m_fields->elapsedTime;
                 rel.targetFrame60 = static_cast<int>(std::round(rel.targetTime * REF_FPS));
                 rel.quickTapRelease = isTapVehicle(detectVehicle(m_player1));
                 m_fields->pendingQueue.push_back(rel);
@@ -1337,55 +1250,33 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
             return;
         }
 
-        DelayDecision decision = findBestDelayFrame(down, margin, lookahead, false);
-        m_fields->lastDecisionDelay = decision.delay;
-        m_fields->lastDecisionReason = decision.reason;
+        DelayDecision decision = findBestGhostDelay(down, maxDelayTicks, lookaheadFrames, false);
+        m_fields->lastDelayTicks = decision.delayTicks;
+        m_fields->lastReason = decision.reason;
 
-        if (decision.fireNow || decision.delay <= 0) {
+        if (decision.fireNow || decision.delayTicks <= 0) {
             m_fields->pendingQueue.clear();
             dispatchButton(down, button, isPlayer1);
             return;
         }
 
-        // Encolar accion usando tiempo continuo (funciona igual a 60, 90, 120 o 240 FPS)
+        // Encolar la accion con reloj continuo (exacto a 60, 90, 120 o 240 FPS)
         m_fields->pendingQueue.clear();
         PendingAction act;
         act.down = down;
         act.button = button;
         act.isPlayer1 = isPlayer1;
         act.createdTime = m_fields->elapsedTime;
-        act.targetTime = m_fields->elapsedTime + (static_cast<double>(decision.delay) / REF_FPS);
+        act.targetTime = m_fields->elapsedTime + (static_cast<double>(decision.delayTicks) / PHYS_TPS);
         act.expireTime = m_fields->elapsedTime + marginSec;
+        act.lastRescanTime = m_fields->elapsedTime;
         act.targetFrame60 = static_cast<int>(std::round(act.targetTime * REF_FPS));
         act.quickTapRelease = false;
         m_fields->pendingQueue.push_back(act);
     }
 
-    // Se ejecuta en CADA frame de pantalla (60, 120 o 240 FPS) sin cuantizar a 60 Hz
     void tickFrameAssist(float dt) {
-        ensureSpatialCache();
-        updateDetectedFloor();
-
-        // Medir velocidad horizontal real en px por 1/60s (independiente de los FPS)
-        if (m_player1 && dt > 0.0005f && dt < 0.15f) {
-            float curX = m_player1->getPositionX();
-            if (m_fields->hasLastX) {
-                float dx = curX - m_fields->lastPlayerX;
-                if (dx > 0.01f && dx < 120.f) {
-                    float instVx60 = (dx / dt) / static_cast<float>(REF_FPS);
-                    if (instVx60 > 1.5f && instVx60 < 18.f) {
-                        if (m_fields->measuredVxPerFrame <= 0.f) {
-                            m_fields->measuredVxPerFrame = instVx60;
-                        } else {
-                            m_fields->measuredVxPerFrame =
-                                m_fields->measuredVxPerFrame * 0.75f + instVx60 * 0.25f;
-                        }
-                    }
-                }
-            }
-            m_fields->lastPlayerX = curX;
-            m_fields->hasLastX = true;
-        }
+        ensureInteractiveCache();
 
         m_fields->elapsedTime += static_cast<double>(dt);
         m_fields->currentFrame60 = static_cast<int>(m_fields->elapsedTime * REF_FPS);
@@ -1398,11 +1289,10 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
         }
 
         auto& front = m_fields->pendingQueue.front();
-        int lookahead = static_cast<int>(Mod::get()->getSettingValue<int64_t>("lookahead-frames"));
-        double remainingSec = std::max(0.0, front.expireTime - m_fields->elapsedTime);
-        int remainingMargin = static_cast<int>(std::ceil(remainingSec * REF_FPS));
+        int lookaheadFrames = static_cast<int>(Mod::get()->getSettingValue<int64_t>("lookahead-frames"));
 
         bool shouldTrigger = false;
+        bool wasSaved = false;
 
         if (front.quickTapRelease) {
             if (m_fields->elapsedTime >= front.targetTime) {
@@ -1410,36 +1300,57 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
             }
         } else if (m_fields->elapsedTime >= front.expireTime) {
             shouldTrigger = true;
-            m_fields->lastDecisionReason = "LIMITE";
+            m_fields->lastReason = "LIMITE";
         } else {
-            DelayDecision live = findBestDelayFrame(front.down, remainingMargin, lookahead, true);
-            m_fields->lastDecisionDelay = live.delay;
-            m_fields->lastDecisionReason = live.reason;
+            bool nowSafe = false;
+            bool nextSafe = false;
+            evaluateLiveTrigger(front.down, lookaheadFrames, nowSafe, nextSafe);
 
-            if (live.fireNow) {
+            if (nowSafe && (m_fields->elapsedTime >= front.targetTime || !nextSafe)) {
                 shouldTrigger = true;
-            } else {
-                front.targetTime = m_fields->elapsedTime + (static_cast<double>(live.delay) / REF_FPS);
-                front.targetFrame60 = static_cast<int>(std::round(front.targetTime * REF_FPS));
+                wasSaved = true;
+                m_fields->lastDelayTicks = 0;
+                m_fields->lastReason = "GHOST_OK";
+            } else if (m_fields->elapsedTime >= front.targetTime ||
+                       (m_fields->elapsedTime - front.lastRescanTime) >= (1.0 / REF_FPS)) {
+                // Re-escanear ventana restante cada ~1/60s o si llegamos al objetivo sin ser seguro aun
+                double remainingSec = std::max(0.0, front.expireTime - m_fields->elapsedTime);
+                int remainingTicks = static_cast<int>(std::ceil(remainingSec * PHYS_TPS));
+                DelayDecision live = findBestGhostDelay(front.down, remainingTicks, lookaheadFrames, true);
+                front.lastRescanTime = m_fields->elapsedTime;
+                m_fields->lastDelayTicks = live.delayTicks;
+                m_fields->lastReason = live.reason;
+
+                if (live.fireNow) {
+                    shouldTrigger = true;
+                    wasSaved = true;
+                } else {
+                    front.targetTime = m_fields->elapsedTime + (static_cast<double>(live.delayTicks) / PHYS_TPS);
+                    front.targetFrame60 = static_cast<int>(std::round(front.targetTime * REF_FPS));
+                }
             }
         }
 
         if (shouldTrigger) {
             PendingAction action = front;
             m_fields->pendingQueue.pop_front();
+            if (wasSaved) {
+                m_fields->savedInputsCount++;
+            }
 
             if (!m_fields->pendingQueue.empty() && action.down && !m_fields->pendingQueue.front().down) {
-                int margin = static_cast<int>(Mod::get()->getSettingValue<int64_t>("margin-frames"));
-                double marginSec = static_cast<double>(margin) / REF_FPS;
+                int marginFrames = static_cast<int>(Mod::get()->getSettingValue<int64_t>("margin-frames"));
+                double marginSec = static_cast<double>(marginFrames * TICKS_PER_FRAME60) / PHYS_TPS;
                 auto& nextRel = m_fields->pendingQueue.front();
                 if (nextRel.quickTapRelease) {
-                    nextRel.targetTime = m_fields->elapsedTime + (2.0 / REF_FPS);
+                    nextRel.targetTime = m_fields->elapsedTime + (4.0 / PHYS_TPS);
                     nextRel.expireTime = nextRel.targetTime;
                     nextRel.targetFrame60 = static_cast<int>(std::round(nextRel.targetTime * REF_FPS));
                 } else {
                     nextRel.createdTime = m_fields->elapsedTime;
-                    nextRel.targetTime = m_fields->elapsedTime + (1.0 / REF_FPS);
+                    nextRel.targetTime = m_fields->elapsedTime + (2.0 / PHYS_TPS);
                     nextRel.expireTime = m_fields->elapsedTime + marginSec;
+                    nextRel.lastRescanTime = m_fields->elapsedTime;
                     nextRel.targetFrame60 = static_cast<int>(std::round(nextRel.targetTime * REF_FPS));
                 }
             }
@@ -1451,9 +1362,9 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
     }
 
     int getCurrentFrame60() { return m_fields->currentFrame60; }
-    size_t getHazardCount() { return m_fields->hazards.size(); }
-    int getLastDecisionDelay() { return m_fields->lastDecisionDelay; }
-    std::string getLastDecisionReason() { return m_fields->lastDecisionReason; }
+    int getSavedInputsCount() { return m_fields->savedInputsCount; }
+    int getLastDelayTicks() { return m_fields->lastDelayTicks; }
+    std::string getLastReason() { return m_fields->lastReason; }
 
     bool hasPendingAction() {
         return !m_fields->pendingQueue.empty();
@@ -1465,6 +1376,9 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
     }
 };
 
+// ============================================================================
+// 5. INTEGRACION CON EL NIVEL Y HUD (PlayLayer)
+// ============================================================================
 class $modify(FrameAssistPlayLayer, PlayLayer) {
     struct Fields {
         CCLabelBMFont* hudLabel = nullptr;
@@ -1475,14 +1389,14 @@ class $modify(FrameAssistPlayLayer, PlayLayer) {
 
         auto base = static_cast<FrameAssistGameLayer*>(static_cast<GJBaseGameLayer*>(this));
         base->resetAssistState();
-        base->ensureSpatialCache();
+        base->ensureInteractiveCache();
 
         applySafeModeIfNeeded();
 
         if (Mod::get()->getSettingValue<bool>("mod-enabled") &&
             Mod::get()->getSettingValue<bool>("show-hud")) {
             auto winSize = CCDirector::get()->getWinSize();
-            auto hud = CCLabelBMFont::create("F:0 | Cube | H:0 | LISTO", "bigFont.fnt");
+            auto hud = CCLabelBMFont::create("F:0 | Cube | S:0 | GHOST", "bigFont.fnt");
             hud->setID("frame-assist-hud"_spr);
             hud->setAnchorPoint({0.f, 1.f});
             hud->setScale(0.28f);
@@ -1495,11 +1409,42 @@ class $modify(FrameAssistPlayLayer, PlayLayer) {
         return true;
     }
 
+    void destroyPlayer(PlayerObject* player, GameObject* obj) {
+        // Interceptar la muerte del jugador fantasma sin afectar al jugador real
+        if (g_simulatingGhost || isGhostPlayer(player)) {
+            g_ghostDied = true;
+            return;
+        }
+        PlayLayer::destroyPlayer(player, obj);
+    }
+
+    void playGravityEffect(bool flip) {
+        if (g_simulatingGhost) return;
+        PlayLayer::playGravityEffect(flip);
+    }
+
+    void activateEndTrigger(int p0, bool p1, bool p2) {
+        if (g_simulatingGhost) return;
+        PlayLayer::activateEndTrigger(p0, p1, p2);
+    }
+
+    void pauseGame(bool p0) {
+        auto base = static_cast<FrameAssistGameLayer*>(static_cast<GJBaseGameLayer*>(this));
+        base->clearPendingQueue();
+        PlayLayer::pauseGame(p0);
+    }
+
+    void onQuit() {
+        auto base = static_cast<FrameAssistGameLayer*>(static_cast<GJBaseGameLayer*>(this));
+        base->teardownGhosts();
+        PlayLayer::onQuit();
+    }
+
     void resetLevel() {
         PlayLayer::resetLevel();
         auto base = static_cast<FrameAssistGameLayer*>(static_cast<GJBaseGameLayer*>(this));
         base->resetAssistState();
-        base->ensureSpatialCache();
+        base->ensureInteractiveCache();
         applySafeModeIfNeeded();
     }
 
@@ -1524,18 +1469,18 @@ class $modify(FrameAssistPlayLayer, PlayLayer) {
                 m_fields->hudLabel->setColor({255, 220, 90});
             } else {
                 stateStr = fmt::format(
-                    "D:{}({})",
-                    base->getLastDecisionDelay(),
-                    base->getLastDecisionReason()
+                    "T:{}({})",
+                    base->getLastDelayTicks(),
+                    base->getLastReason()
                 );
                 m_fields->hudLabel->setColor({150, 255, 160});
             }
 
             m_fields->hudLabel->setString(fmt::format(
-                "F:{} | {} | H:{} | {}{}",
+                "F:{} | {} | S:{} | {}{}",
                 base->getCurrentFrame60(),
                 vehicleName(mode),
-                base->getHazardCount(),
+                base->getSavedInputsCount(),
                 stateStr,
                 safeMode ? " [SAFE]" : ""
             ).c_str());

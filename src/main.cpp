@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <string>
 #include <vector>
@@ -32,8 +33,8 @@ struct SimState {
     float y = 0.f;
     float vxPerFrame = 5.19f; // px por frame a 60 FPS (~311.58 px/s a velocidad 1x)
     float vyPerFrame = 0.f;
-    float halfW = 12.f;
-    float halfH = 12.f;
+    float halfW = 13.f;
+    float halfH = 13.f;
     bool upsideDown = false;
     bool onGround = false;
     bool holding = false;
@@ -42,13 +43,24 @@ struct SimState {
 };
 
 struct PendingAction {
-    bool active = false;
     bool down = false;
     int button = 1;
     bool isPlayer1 = true;
     int createdFrame = 0;
     int targetFrame = 0;
     int expireFrame = 0;
+    bool quickTapRelease = false;
+};
+
+struct SimOutcome {
+    bool survivedAll = true;
+    bool actionEffective = true;
+    int survivalFrames = 0;
+};
+
+struct DelayDecision {
+    int delay = 0;
+    bool delayZeroSafe = true;
 };
 
 VehicleMode detectVehicle(PlayerObject* player) {
@@ -61,6 +73,21 @@ VehicleMode detectVehicle(PlayerObject* player) {
     if (player->m_isSpider) return VehicleMode::Spider;
     if (player->m_isSwing) return VehicleMode::Swing;
     return VehicleMode::Cube;
+}
+
+bool isTapVehicle(VehicleMode mode) {
+    return mode == VehicleMode::Cube ||
+           mode == VehicleMode::Ball ||
+           mode == VehicleMode::UFO ||
+           mode == VehicleMode::Spider ||
+           mode == VehicleMode::Swing;
+}
+
+bool isGroundVehicle(VehicleMode mode) {
+    return mode == VehicleMode::Cube ||
+           mode == VehicleMode::Ball ||
+           mode == VehicleMode::Spider ||
+           mode == VehicleMode::Robot;
 }
 
 const char* vehicleName(VehicleMode mode) {
@@ -106,16 +133,30 @@ bool isSolidObject(GameObject* obj) {
     return obj->m_objectType == GameObjectType::Solid;
 }
 
-CCRect shrinkHazardRect(CCRect r) {
-    // Las hitboxes reales de espinas en GD son mas pequenas que su sprite visual
-    float padX = r.size.width * 0.28f;
-    float padY = r.size.height * 0.28f;
-    return CCRect(
-        r.origin.x + padX,
-        r.origin.y + padY,
-        std::max(2.f, r.size.width - padX * 2.f),
-        std::max(2.f, r.size.height - padY * 2.f)
-    );
+CCRect safeObjectRect(GameObject* obj, bool asHazard) {
+    CCRect r = obj->getObjectRect();
+    if (r.size.width <= 0.5f || r.size.height <= 0.5f) {
+        auto pos = obj->getPosition();
+        auto sz = obj->getScaledContentSize();
+        float w = sz.width > 1.f ? sz.width : 30.f;
+        float h = sz.height > 1.f ? sz.height : 30.f;
+        r = CCRect(pos.x - w * 0.5f, pos.y - h * 0.5f, w, h);
+    }
+
+    if (asHazard) {
+        // getObjectRect() en espinas suele venir ya reducido; solo recortar levemente si es grande
+        if (r.size.width > 22.f && r.size.height > 22.f) {
+            float padX = r.size.width * 0.14f;
+            float padY = r.size.height * 0.14f;
+            r = CCRect(
+                r.origin.x + padX,
+                r.origin.y + padY,
+                std::max(4.f, r.size.width - padX * 2.f),
+                std::max(4.f, r.size.height - padY * 2.f)
+            );
+        }
+    }
+    return r;
 }
 
 SimState captureState(PlayerObject* p, bool isHolding) {
@@ -125,8 +166,11 @@ SimState captureState(PlayerObject* p, bool isHolding) {
     s.x = pos.x;
     s.y = pos.y;
     s.mini = p->m_vehicleSize < 0.8f;
-    s.halfW = std::max(4.f, rect.size.width * 0.42f);
-    s.halfH = std::max(4.f, rect.size.height * 0.42f);
+
+    float baseW = rect.size.width > 2.f ? rect.size.width : (s.mini ? 18.f : 30.f);
+    float baseH = rect.size.height > 2.f ? rect.size.height : (s.mini ? 18.f : 30.f);
+    s.halfW = std::clamp(baseW * 0.45f, 4.f, 15.f);
+    s.halfH = std::clamp(baseH * 0.45f, 4.f, 15.f);
 
     // Velocidad horizontal aproximada por frame a 60 FPS segun m_playerSpeed
     float speedMult = p->m_playerSpeed > 0.1f ? p->m_playerSpeed : 0.9f;
@@ -139,8 +183,9 @@ SimState captureState(PlayerObject* p, bool isHolding) {
     return s;
 }
 
-// Avanza 1 frame (1/60 s) la fisica aproximada del vehiculo activo
-void stepVehicleOneFrame(
+// Avanza 1 frame (1/60 s) la fisica aproximada del vehiculo activo.
+// Devuelve true si choco fatalmente contra un bloque solido.
+bool stepVehicleOneFrame(
     SimState& s,
     bool justPressed,
     bool justReleased,
@@ -257,6 +302,7 @@ void stepVehicleOneFrame(
         }
     }
 
+    float prevX = s.x;
     float prevY = s.y;
     s.x += s.vxPerFrame;
     s.y += s.vyPerFrame;
@@ -269,20 +315,62 @@ void stepVehicleOneFrame(
         s.onGround = true;
     }
 
-    // Aterrizaje simple sobre bloques solidos
+    // Colisiones con bloques solidos (aterrizaje seguro vs choque frontal/techo)
     CCRect pRect(s.x - s.halfW, s.y - s.halfH, s.halfW * 2.f, s.halfH * 2.f);
     for (auto const& box : solids) {
         if (!pRect.intersectsRect(box)) continue;
-        if (!s.upsideDown && prevY - s.halfH >= box.getMaxY() - 8.f && s.vyPerFrame <= 0.f) {
+
+        // Wave muere al tocar cualquier bloque solido
+        if (s.mode == VehicleMode::Wave) {
+            return true;
+        }
+
+        // Aterrizaje por arriba (gravedad normal)
+        if (!s.upsideDown && prevY - s.halfH >= box.getMaxY() - 10.f && s.vyPerFrame <= 0.f) {
             s.y = box.getMaxY() + s.halfH;
             s.vyPerFrame = 0.f;
             s.onGround = true;
-        } else if (s.upsideDown && prevY + s.halfH <= box.getMinY() + 8.f && s.vyPerFrame >= 0.f) {
+            continue;
+        }
+        // Aterrizaje por abajo (gravedad invertida)
+        if (s.upsideDown && prevY + s.halfH <= box.getMinY() + 10.f && s.vyPerFrame >= 0.f) {
             s.y = box.getMinY() - s.halfH;
             s.vyPerFrame = 0.f;
             s.onGround = true;
+            continue;
+        }
+
+        // En Ship/UFO/Ball/Swing, rozar techo/suelo desliza; solo choque frontal mata
+        bool canSlideCeiling = (
+            s.mode == VehicleMode::Ship ||
+            s.mode == VehicleMode::UFO ||
+            s.mode == VehicleMode::Ball ||
+            s.mode == VehicleMode::Swing
+        );
+        if (canSlideCeiling) {
+            if (!s.upsideDown && prevY + s.halfH <= box.getMinY() + 10.f && s.vyPerFrame >= 0.f) {
+                s.y = box.getMinY() - s.halfH;
+                s.vyPerFrame = 0.f;
+                continue;
+            }
+            if (s.upsideDown && prevY - s.halfH >= box.getMaxY() - 10.f && s.vyPerFrame <= 0.f) {
+                s.y = box.getMaxY() + s.halfH;
+                s.vyPerFrame = 0.f;
+                continue;
+            }
+        }
+
+        // Choque lateral frontal contra pared del bloque (o techo en Cube/Robot/Spider)
+        float innerHalfH = s.halfH * 0.65f;
+        bool verticalCoreOverlap = (s.y + innerHalfH > box.getMinY() + 2.f) &&
+                                   (s.y - innerHalfH < box.getMaxY() - 2.f);
+        bool hitFrontWall = (prevX + s.halfW <= box.getMinX() + s.vxPerFrame + 5.f);
+        if (verticalCoreOverlap || hitFrontWall || !canSlideCeiling) {
+            return true;
         }
     }
+
+    return false;
 }
 
 } // namespace
@@ -515,7 +603,7 @@ protected:
         Mod::get()->setSettingValue<bool>("show-hud", true);
         Mod::get()->setSettingValue<bool>("enable-in-practice", true);
         Mod::get()->setSettingValue<int64_t>("margin-frames", 16);
-        Mod::get()->setSettingValue<int64_t>("lookahead-frames", 24);
+        Mod::get()->setSettingValue<int64_t>("lookahead-frames", 28);
         Mod::get()->setSettingValue<double>("ui-scale", 1.0);
 
         m_enabledToggle->toggle(true);
@@ -529,9 +617,9 @@ protected:
         m_marginSlider->updateBar();
         m_marginValLabel->setString("16f");
 
-        m_lookaheadSlider->setValue(static_cast<float>(24 - MIN_LOOKAHEAD) / (MAX_LOOKAHEAD - MIN_LOOKAHEAD));
+        m_lookaheadSlider->setValue(static_cast<float>(28 - MIN_LOOKAHEAD) / (MAX_LOOKAHEAD - MIN_LOOKAHEAD));
         m_lookaheadSlider->updateBar();
-        m_lookaheadValLabel->setString("24f");
+        m_lookaheadValLabel->setString("28f");
 
         m_scaleSlider->setValue((1.0f - MIN_SCALE) / (MAX_SCALE - MIN_SCALE));
         m_scaleSlider->updateBar();
@@ -670,8 +758,8 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
         int currentFrame60 = 0;
         bool actualHolding = false;
         bool isDispatchingBuffered = false;
-        bool indexBuilt = false;
-        PendingAction pending;
+        size_t cachedObjectCount = 0;
+        std::deque<PendingAction> pendingQueue;
 
         std::vector<GameObject*> hazards;
         std::vector<GameObject*> solids;
@@ -679,20 +767,22 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
     };
 
     bool isAssistActive() {
-        auto playLayer = typeinfo_cast<PlayLayer*>(this);
-        if (!playLayer) return false;
+        auto playLayer = PlayLayer::get();
+        if (!playLayer || static_cast<GJBaseGameLayer*>(playLayer) != this) return false;
         if (!Mod::get()->getSettingValue<bool>("mod-enabled")) return false;
         if (m_isPracticeMode && !Mod::get()->getSettingValue<bool>("enable-in-practice")) return false;
         if (!m_player1 || m_player1->m_isDead) return false;
         return true;
     }
 
-    void buildSpatialCache() {
+    void ensureSpatialCache() {
+        if (!m_objects) return;
+        size_t count = static_cast<size_t>(m_objects->count());
+        if (count == 0 || count == m_fields->cachedObjectCount) return;
+
         m_fields->hazards.clear();
         m_fields->solids.clear();
         m_fields->orbs.clear();
-
-        if (!m_objects) return;
 
         for (auto* obj : CCArrayExt<GameObject*>(m_objects)) {
             if (!obj) continue;
@@ -712,14 +802,14 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
         std::sort(m_fields->solids.begin(), m_fields->solids.end(), sortByX);
         std::sort(m_fields->orbs.begin(), m_fields->orbs.end(), sortByX);
 
-        m_fields->indexBuilt = true;
+        m_fields->cachedObjectCount = count;
     }
 
     void resetAssistState() {
         m_fields->elapsedTime = 0.0;
         m_fields->currentFrame60 = 0;
         m_fields->actualHolding = false;
-        m_fields->pending = PendingAction{};
+        m_fields->pendingQueue.clear();
     }
 
     void gatherNearbyRects(
@@ -727,7 +817,7 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
         float minX,
         float maxX,
         std::vector<CCRect>& out,
-        bool shrinkAsHazard
+        bool asHazard
     ) {
         out.clear();
         auto it = std::lower_bound(
@@ -737,30 +827,38 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
         for (; it != list.end(); ++it) {
             GameObject* obj = *it;
             if (obj->getPositionX() > maxX) break;
-            if (obj->m_isDisabled || !obj->isVisible()) continue;
-            CCRect r = obj->getObjectRect();
-            out.push_back(shrinkAsHazard ? shrinkHazardRect(r) : r);
+            if (obj->m_isDisabled) continue;
+            out.push_back(safeObjectRect(obj, asHazard));
         }
     }
 
-    // Evalua si ejecutar `actionDown` exactamente tras `delayFrames` mantiene vivo al jugador
-    bool simulateTrajectorySafe(
+    // Evalua cuantos frames sobrevive el jugador si ejecuta `actionDown` exactamente en `delayFrames`
+    SimOutcome simulateTrajectory(
         SimState initial,
         bool actionDown,
         int delayFrames,
-        int lookaheadFrames,
+        int commonHorizon,
         std::vector<CCRect> const& nearHazards,
         std::vector<CCRect> const& nearSolids,
-        std::vector<CCRect> const& nearOrbs,
-        bool& outActionWasEffective
+        std::vector<CCRect> const& nearOrbs
     ) {
         SimState s = initial;
-        outActionWasEffective = true;
-        int totalFrames = delayFrames + lookaheadFrames;
+        SimOutcome result;
+        result.survivedAll = true;
+        result.actionEffective = true;
+        result.survivalFrames = commonHorizon;
 
-        for (int f = 0; f <= totalFrames; ++f) {
+        bool tapMode = actionDown && isTapVehicle(s.mode);
+
+        for (int f = 0; f <= commonHorizon; ++f) {
             bool justPressed = (f == delayFrames && actionDown);
             bool justReleased = (f == delayFrames && !actionDown);
+
+            // Para vehiculos de toque (Cube/Ball/UFO/Spider/Swing), simular un toque limpio
+            // soltando 2 frames despues para no provocar saltos automaticos falsos en la prediccion
+            if (tapMode && f == delayFrames + 2) {
+                justReleased = true;
+            }
 
             CCRect pRect(s.x - s.halfW, s.y - s.halfH, s.halfW * 2.f, s.halfH * 2.f);
             bool touchingOrb = false;
@@ -771,35 +869,41 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
                 }
             }
 
-            // En vehiculos de suelo (Cube, Ball, Spider, Robot), presionar en el aire sin orbe no tiene efecto inmediato
-            if (justPressed && !touchingOrb && !s.onGround) {
-                if (s.mode == VehicleMode::Cube ||
-                    s.mode == VehicleMode::Ball ||
-                    s.mode == VehicleMode::Spider ||
-                    s.mode == VehicleMode::Robot) {
-                    outActionWasEffective = false;
-                }
+            // En vehiculos de suelo, presionar en el aire sin orbe no tiene efecto inmediato
+            if (justPressed && !touchingOrb && !s.onGround && isGroundVehicle(s.mode)) {
+                result.actionEffective = false;
             }
 
-            stepVehicleOneFrame(s, justPressed, justReleased, touchingOrb, nearSolids);
+            bool crashedSolid = stepVehicleOneFrame(s, justPressed, justReleased, touchingOrb, nearSolids);
+            if (crashedSolid) {
+                result.survivedAll = false;
+                result.survivalFrames = f;
+                return result;
+            }
 
-            CCRect nextRect(s.x - s.halfW, s.y - s.halfH, s.halfW * 2.f, s.halfH * 2.f);
+            // Hitbox de espinas del jugador ligeramente interior
+            float hx = s.halfW * 0.85f;
+            float hy = s.halfH * 0.85f;
+            CCRect hazardCheckRect(s.x - hx, s.y - hy, hx * 2.f, hy * 2.f);
             for (auto const& hz : nearHazards) {
-                if (nextRect.intersectsRect(hz)) {
-                    return false; // Muerte predicha en el frame f
+                if (hazardCheckRect.intersectsRect(hz)) {
+                    result.survivedAll = false;
+                    result.survivalFrames = f;
+                    return result;
                 }
             }
         }
-        return true;
+        return result;
     }
 
-    // Busca el mejor frame dentro de [0 .. marginFrames] para ejecutar la accion
-    int findBestDelayFrame(bool actionDown, int marginFrames, int lookaheadFrames) {
-        if (!m_fields->indexBuilt) buildSpatialCache();
+    // Busca el mejor frame dentro de [0 .. marginFrames] comparando todos sobre el mismo horizonte
+    DelayDecision findBestDelayFrame(bool actionDown, int marginFrames, int lookaheadFrames) {
+        ensureSpatialCache();
 
         SimState initial = captureState(m_player1, m_fields->actualHolding);
-        float maxDist = initial.vxPerFrame * static_cast<float>(marginFrames + lookaheadFrames + 8);
-        float minX = initial.x - 45.f;
+        int commonHorizon = marginFrames + std::max(lookaheadFrames, 24);
+        float maxDist = initial.vxPerFrame * static_cast<float>(commonHorizon + 12);
+        float minX = initial.x - 60.f;
         float maxX = initial.x + maxDist;
 
         std::vector<CCRect> nearHazards;
@@ -809,39 +913,74 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
         gatherNearbyRects(m_fields->solids, minX, maxX, nearSolids, false);
         gatherNearbyRects(m_fields->orbs, minX, maxX, nearOrbs, false);
 
-        // 1. Verificar si ejecutar YA MISMO (delay 0) es seguro y efectivo
-        bool effectiveNow = true;
-        bool safeNow = simulateTrajectorySafe(
-            initial, actionDown, 0, lookaheadFrames,
-            nearHazards, nearSolids, nearOrbs, effectiveNow
+        // Si no hay obstaculos en rango y no estamos cayendo al suelo para saltar, actuar ya
+        if (nearHazards.empty() && nearSolids.empty() && nearOrbs.empty()) {
+            return {0, true};
+        }
+
+        // 1. Evaluar delay = 0 (ejecutar ahora mismo)
+        SimOutcome nowOut = simulateTrajectory(
+            initial, actionDown, 0, commonHorizon,
+            nearHazards, nearSolids, nearOrbs
         );
-        if (safeNow && effectiveNow) {
-            return 0;
+        if (nowOut.survivedAll && nowOut.actionEffective) {
+            return {0, true};
         }
 
-        // 2. Buscar el primer frame seguro y efectivo dentro del margen (1 .. marginFrames)
-        int fallbackSafeDelay = -1;
+        // 2. Evaluar todos los delays dentro del margen [1 .. marginFrames]
+        int firstSafeEffective = -1;
+        int lastSafeEffective = -1;
+        int firstSafeAny = -1;
+
+        int bestSurviveDelay = 0;
+        int bestSurviveFrames = nowOut.survivalFrames;
+        bool bestSurviveEffective = nowOut.actionEffective;
+
         for (int delay = 1; delay <= marginFrames; ++delay) {
-            bool effective = true;
-            bool safe = simulateTrajectorySafe(
-                initial, actionDown, delay, lookaheadFrames,
-                nearHazards, nearSolids, nearOrbs, effective
+            SimOutcome out = simulateTrajectory(
+                initial, actionDown, delay, commonHorizon,
+                nearHazards, nearSolids, nearOrbs
             );
-            if (safe && effective) {
-                return delay;
+
+            if (out.survivedAll && out.actionEffective) {
+                if (firstSafeEffective < 0) firstSafeEffective = delay;
+                lastSafeEffective = delay;
+            } else if (out.survivedAll && firstSafeAny < 0) {
+                firstSafeAny = delay;
             }
-            if (safe && fallbackSafeDelay < 0) {
-                fallbackSafeDelay = delay;
+
+            // Registrar la trayectoria que sobrevive mas frames si ningun delay cubre todo el horizonte
+            bool betterSurvival = (out.survivalFrames > bestSurviveFrames) ||
+                                  (out.survivalFrames == bestSurviveFrames &&
+                                   out.actionEffective && !bestSurviveEffective);
+            if (betterSurvival) {
+                bestSurviveFrames = out.survivalFrames;
+                bestSurviveDelay = delay;
+                bestSurviveEffective = out.actionEffective;
             }
         }
 
-        // Si hubo algun frame seguro aunque no efectivo (ej. esperar a esquivar), usarlo
-        if (fallbackSafeDelay >= 0) {
-            return fallbackSafeDelay;
+        // Si existe ventana segura efectiva, tomar el inicio + 1 frame de margen si la ventana lo permite
+        if (firstSafeEffective >= 0) {
+            int chosen = firstSafeEffective;
+            if (lastSafeEffective - firstSafeEffective >= 2) {
+                chosen = firstSafeEffective + 1;
+            }
+            return {chosen, false};
         }
 
-        // Si ningun retraso mejora la situacion, ejecutar de inmediato para no bloquear control
-        return 0;
+        // Si existe algun delay seguro aunque no efectivo (ej. evitar muerte inmediata)
+        if (firstSafeAny >= 0) {
+            return {firstSafeAny, false};
+        }
+
+        // Si ningun delay sobrevive todo el horizonte (hay otro obstaculo mas adelante),
+        // retrasar si gana al menos 2 frames reales de supervivencia respecto a actuar ahora
+        if (bestSurviveDelay > 0 && bestSurviveFrames >= nowOut.survivalFrames + 2) {
+            return {bestSurviveDelay, false};
+        }
+
+        return {0, nowOut.survivedAll};
     }
 
     void dispatchButton(bool down, int button, bool isPlayer1) {
@@ -860,69 +999,122 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
 
         bool assistPress = Mod::get()->getSettingValue<bool>("buffer-press");
         bool assistRelease = Mod::get()->getSettingValue<bool>("buffer-release");
-
-        if ((down && !assistPress) || (!down && !assistRelease)) {
-            m_fields->pending.active = false;
-            dispatchButton(down, button, isPlayer1);
-            return;
-        }
-
         int margin = static_cast<int>(Mod::get()->getSettingValue<int64_t>("margin-frames"));
         int lookahead = static_cast<int>(Mod::get()->getSettingValue<int64_t>("lookahead-frames"));
 
-        int bestDelay = findBestDelayFrame(down, margin, lookahead);
+        // CASO CLAVE EN ANDROID (toque rapido):
+        // Si ya tenemos un CLIC esperando en la cola y el usuario levanta el dedo antes de que dispare,
+        // NO cancelar el clic pendiente: encolar el SOLTAR detras para que el salto se ejecute completo.
+        if (!down && !m_fields->pendingQueue.empty() && m_fields->pendingQueue.front().down) {
+            // Evitar duplicar releases seguidos
+            if (m_fields->pendingQueue.back().down) {
+                PendingAction rel;
+                rel.down = false;
+                rel.button = button;
+                rel.isPlayer1 = isPlayer1;
+                rel.createdFrame = m_fields->currentFrame60;
+                rel.targetFrame = m_fields->pendingQueue.front().targetFrame + 2;
+                rel.expireFrame = m_fields->pendingQueue.front().expireFrame + margin;
+                rel.quickTapRelease = isTapVehicle(detectVehicle(m_player1));
+                m_fields->pendingQueue.push_back(rel);
+            }
+            return;
+        }
 
-        if (bestDelay <= 0) {
-            m_fields->pending.active = false;
+        // Si habia un SOLTAR esperando y el usuario vuelve a presionar, descartar el soltar pendiente
+        // y continuar manteniendo si ya estaba presionado
+        if (down && !m_fields->pendingQueue.empty() && !m_fields->pendingQueue.front().down) {
+            m_fields->pendingQueue.clear();
+            if (m_fields->actualHolding) {
+                return;
+            }
+        }
+
+        if ((down && !assistPress) || (!down && !assistRelease)) {
+            m_fields->pendingQueue.clear();
             dispatchButton(down, button, isPlayer1);
             return;
         }
 
-        // Guardar la accion en el bufer para ejecutarla en el frame seguro
-        m_fields->pending.active = true;
-        m_fields->pending.down = down;
-        m_fields->pending.button = button;
-        m_fields->pending.isPlayer1 = isPlayer1;
-        m_fields->pending.createdFrame = m_fields->currentFrame60;
-        m_fields->pending.targetFrame = m_fields->currentFrame60 + bestDelay;
-        m_fields->pending.expireFrame = m_fields->currentFrame60 + margin;
-    }
+        DelayDecision decision = findBestDelayFrame(down, margin, lookahead);
 
-    void tickFrameAssist(float dt) {
-        m_fields->elapsedTime += static_cast<double>(dt);
-        int newFrame = static_cast<int>(m_fields->elapsedTime * REF_FPS);
-
-        // Ejecutar evaluacion cada avance de frame (60 FPS)
-        if (newFrame == m_fields->currentFrame60) return;
-        m_fields->currentFrame60 = newFrame;
-
-        if (!m_fields->pending.active) return;
-
-        if (!isAssistActive()) {
-            m_fields->pending.active = false;
+        if (decision.delay <= 0) {
+            m_fields->pendingQueue.clear();
+            dispatchButton(down, button, isPlayer1);
             return;
         }
 
+        // Encolar la accion para ejecutarla en el frame seguro
+        m_fields->pendingQueue.clear();
+        PendingAction act;
+        act.down = down;
+        act.button = button;
+        act.isPlayer1 = isPlayer1;
+        act.createdFrame = m_fields->currentFrame60;
+        act.targetFrame = m_fields->currentFrame60 + decision.delay;
+        act.expireFrame = m_fields->currentFrame60 + margin;
+        act.quickTapRelease = false;
+        m_fields->pendingQueue.push_back(act);
+    }
+
+    void tickFrameAssist(float dt) {
+        ensureSpatialCache();
+
+        m_fields->elapsedTime += static_cast<double>(dt);
+        int newFrame = static_cast<int>(m_fields->elapsedTime * REF_FPS);
+
+        // Evaluar cada avance de frame (60 FPS)
+        if (newFrame == m_fields->currentFrame60) return;
+        m_fields->currentFrame60 = newFrame;
+
+        if (m_fields->pendingQueue.empty()) return;
+
+        if (!isAssistActive()) {
+            m_fields->pendingQueue.clear();
+            return;
+        }
+
+        auto& front = m_fields->pendingQueue.front();
         int lookahead = static_cast<int>(Mod::get()->getSettingValue<int64_t>("lookahead-frames"));
-        int remainingMargin = std::max(0, m_fields->pending.expireFrame - newFrame);
+        int remainingMargin = std::max(0, front.expireFrame - newFrame);
 
         bool shouldTrigger = false;
 
-        if (newFrame >= m_fields->pending.expireFrame) {
-            // Se cumplio el margen maximo (ej. 16 frames): ejecutar la accion ahora
+        if (front.quickTapRelease) {
+            // Liberacion automatica de un toque rapido tras ejecutarse el salto diferido
+            if (newFrame >= front.targetFrame) {
+                shouldTrigger = true;
+            }
+        } else if (newFrame >= front.expireFrame) {
+            // Se alcanzo el limite del margen (ej. 16 frames): ejecutar la accion ahora
             shouldTrigger = true;
         } else {
-            // Reevaluar en tiempo real con la posicion real del jugador
-            int liveDelay = findBestDelayFrame(m_fields->pending.down, remainingMargin, lookahead);
-            m_fields->pending.targetFrame = newFrame + liveDelay;
-            if (liveDelay == 0) {
+            // Reevaluar en tiempo real con la posicion exacta del jugador
+            DelayDecision live = findBestDelayFrame(front.down, remainingMargin, lookahead);
+            if (live.delay == 0 && (live.delayZeroSafe || newFrame >= front.targetFrame)) {
                 shouldTrigger = true;
+            } else if (live.delay > 0) {
+                front.targetFrame = newFrame + live.delay;
             }
         }
 
         if (shouldTrigger) {
-            auto action = m_fields->pending;
-            m_fields->pending.active = false;
+            PendingAction action = front;
+            m_fields->pendingQueue.pop_front();
+
+            // Si queda un SOLTAR detras de un CLIC recien ejecutado, ajustar su ventana desde este frame
+            if (!m_fields->pendingQueue.empty() && action.down && !m_fields->pendingQueue.front().down) {
+                int margin = static_cast<int>(Mod::get()->getSettingValue<int64_t>("margin-frames"));
+                auto& nextRel = m_fields->pendingQueue.front();
+                if (nextRel.quickTapRelease) {
+                    nextRel.targetFrame = newFrame + 2;
+                    nextRel.expireFrame = newFrame + 2;
+                } else {
+                    nextRel.createdFrame = newFrame;
+                    nextRel.targetFrame = newFrame + 1;
+                    nextRel.expireFrame = newFrame + margin;
+                }
+            }
 
             m_fields->isDispatchingBuffered = true;
             dispatchButton(action.down, action.button, action.isPlayer1);
@@ -934,8 +1126,17 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
         return m_fields->currentFrame60;
     }
 
-    PendingAction getPendingAction() {
-        return m_fields->pending;
+    size_t getHazardCount() {
+        return m_fields->hazards.size();
+    }
+
+    bool hasPendingAction() {
+        return !m_fields->pendingQueue.empty();
+    }
+
+    PendingAction getFrontPendingAction() {
+        if (m_fields->pendingQueue.empty()) return PendingAction{};
+        return m_fields->pendingQueue.front();
     }
 };
 
@@ -949,18 +1150,18 @@ class $modify(FrameAssistPlayLayer, PlayLayer) {
 
         auto base = static_cast<FrameAssistGameLayer*>(static_cast<GJBaseGameLayer*>(this));
         base->resetAssistState();
-        base->buildSpatialCache();
+        base->ensureSpatialCache();
 
         applySafeModeIfNeeded();
 
         if (Mod::get()->getSettingValue<bool>("mod-enabled") &&
             Mod::get()->getSettingValue<bool>("show-hud")) {
             auto winSize = CCDirector::get()->getWinSize();
-            auto hud = CCLabelBMFont::create("F: 0 | Cube | LISTO", "bigFont.fnt");
+            auto hud = CCLabelBMFont::create("F:0 | Cube | H:0 | LISTO", "bigFont.fnt");
             hud->setID("frame-assist-hud"_spr);
             hud->setAnchorPoint({0.f, 1.f});
-            hud->setScale(0.30f);
-            hud->setOpacity(175);
+            hud->setScale(0.28f);
+            hud->setOpacity(185);
             hud->setPosition({8.f, winSize.height - 6.f});
             this->addChild(hud, 100);
             m_fields->hudLabel = hud;
@@ -973,6 +1174,7 @@ class $modify(FrameAssistPlayLayer, PlayLayer) {
         PlayLayer::resetLevel();
         auto base = static_cast<FrameAssistGameLayer*>(static_cast<GJBaseGameLayer*>(this));
         base->resetAssistState();
+        base->ensureSpatialCache();
         applySafeModeIfNeeded();
     }
 
@@ -985,10 +1187,10 @@ class $modify(FrameAssistPlayLayer, PlayLayer) {
         if (m_fields->hudLabel && m_player1) {
             auto mode = detectVehicle(m_player1);
             bool safeMode = Mod::get()->getSettingValue<bool>("safe-mode");
-            auto pending = base->getPendingAction();
 
             std::string stateStr;
-            if (pending.active) {
+            if (base->hasPendingAction()) {
+                auto pending = base->getFrontPendingAction();
                 stateStr = fmt::format(
                     "ESPERANDO {} -> F:{}",
                     pending.down ? "CLIC" : "SOLTAR",
@@ -1001,9 +1203,10 @@ class $modify(FrameAssistPlayLayer, PlayLayer) {
             }
 
             m_fields->hudLabel->setString(fmt::format(
-                "F:{} | {} | {}{}",
+                "F:{} | {} | H:{} | {}{}",
                 base->getCurrentFrame60(),
                 vehicleName(mode),
+                base->getHazardCount(),
                 stateStr,
                 safeMode ? " [SAFE]" : ""
             ).c_str());

@@ -19,7 +19,7 @@ jobs:
       - name: Compilar mod con Geode SDK
         uses: geode-sdk/build-geode-mod@main
         with:
-          target: android64
+          target: Android64
           sdk: v6.0.0
 
       - name: Subir archivo .geode

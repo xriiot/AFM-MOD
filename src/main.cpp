@@ -31,10 +31,11 @@ enum class VehicleMode {
 struct SimState {
     float x = 0.f;
     float y = 0.f;
-    float vxPerFrame = 5.19f; // px por frame a 60 FPS (~311.58 px/s a velocidad 1x)
+    float vxPerFrame = 5.193f; // px por frame a 60 FPS (~311.58 px/s a 1x)
     float vyPerFrame = 0.f;
-    float halfW = 13.f;
-    float halfH = 13.f;
+    float halfW = 13.5f;
+    float halfH = 13.5f;
+    float floorY = 0.f;
     bool upsideDown = false;
     bool onGround = false;
     bool holding = false;
@@ -61,6 +62,7 @@ struct SimOutcome {
 struct DelayDecision {
     int delay = 0;
     bool delayZeroSafe = true;
+    const char* reason = "OK";
 };
 
 VehicleMode detectVehicle(PlayerObject* player) {
@@ -144,22 +146,31 @@ CCRect safeObjectRect(GameObject* obj, bool asHazard) {
     }
 
     if (asHazard) {
-        // getObjectRect() en espinas suele venir ya reducido; solo recortar levemente si es grande
-        if (r.size.width > 22.f && r.size.height > 22.f) {
-            float padX = r.size.width * 0.14f;
-            float padY = r.size.height * 0.14f;
+        // Solo recortar si vino como tile completo de 30x30; no encoger hitboxes ya exactas
+        if (r.size.width > 24.f && r.size.height > 24.f) {
+            float padX = r.size.width * 0.12f;
+            float padY = r.size.height * 0.12f;
             r = CCRect(
                 r.origin.x + padX,
                 r.origin.y + padY,
-                std::max(4.f, r.size.width - padX * 2.f),
-                std::max(4.f, r.size.height - padY * 2.f)
+                std::max(6.f, r.size.width - padX * 2.f),
+                std::max(6.f, r.size.height - padY * 2.f)
             );
         }
     }
     return r;
 }
 
-SimState captureState(PlayerObject* p, bool isHolding) {
+float estimateVxFromSpeed(float playerSpeed) {
+    // Velocidades reales de GD en px/frame a 60 FPS
+    if (playerSpeed <= 0.75f) return 251.16f / 60.f;      // 0.5x
+    if (playerSpeed <= 0.98f) return 311.58f / 60.f;      // 1x
+    if (playerSpeed <= 1.20f) return 387.42f / 60.f;      // 2x
+    if (playerSpeed <= 1.45f) return 468.00f / 60.f;      // 3x
+    return 576.00f / 60.f;                                // 4x
+}
+
+SimState captureState(PlayerObject* p, bool isHolding, float measuredVx) {
     SimState s;
     auto pos = p->getPosition();
     auto rect = p->getObjectRect();
@@ -169,21 +180,26 @@ SimState captureState(PlayerObject* p, bool isHolding) {
 
     float baseW = rect.size.width > 2.f ? rect.size.width : (s.mini ? 18.f : 30.f);
     float baseH = rect.size.height > 2.f ? rect.size.height : (s.mini ? 18.f : 30.f);
-    s.halfW = std::clamp(baseW * 0.45f, 4.f, 15.f);
-    s.halfH = std::clamp(baseH * 0.45f, 4.f, 15.f);
+    s.halfW = std::clamp(baseW * 0.48f, 4.f, 15.f);
+    s.halfH = std::clamp(baseH * 0.48f, 4.f, 15.f);
 
-    // Velocidad horizontal aproximada por frame a 60 FPS segun m_playerSpeed
-    float speedMult = p->m_playerSpeed > 0.1f ? p->m_playerSpeed : 0.9f;
-    s.vxPerFrame = (346.2f * speedMult) / static_cast<float>(REF_FPS);
+    if (measuredVx > 1.5f && measuredVx < 18.f) {
+        s.vxPerFrame = measuredVx;
+    } else {
+        float speedMult = p->m_playerSpeed > 0.1f ? p->m_playerSpeed : 0.9f;
+        s.vxPerFrame = estimateVxFromSpeed(speedMult);
+    }
+
     s.vyPerFrame = static_cast<float>(p->m_yVelocity);
     s.upsideDown = p->m_isUpsideDown;
     s.onGround = p->m_isOnGround;
     s.holding = isHolding;
     s.mode = detectVehicle(p);
+    s.floorY = 0.f;
     return s;
 }
 
-// Avanza 1 frame (1/60 s) la fisica aproximada del vehiculo activo.
+// Avanza 1 frame (1/60 s) usando 2 subpasos con la escala fisica real de GD (0.9 por frame a 60 FPS).
 // Devuelve true si choco fatalmente contra un bloque solido.
 bool stepVehicleOneFrame(
     SimState& s,
@@ -200,173 +216,187 @@ bool stepVehicleOneFrame(
 
     // Interaccion con orbe al presionar
     if (justPressed && touchingOrb) {
-        s.vyPerFrame = -gravDir * (11.1f * sizeFactor);
+        s.vyPerFrame = -gravDir * (11.18f * sizeFactor);
         s.onGround = false;
     }
 
-    switch (s.mode) {
-        case VehicleMode::Cube: {
-            if ((justPressed || s.holding) && s.onGround) {
-                s.vyPerFrame = -gravDir * (11.18f * sizeFactor);
-                s.onGround = false;
+    // 2 subpasos por frame de 60 FPS -> dt_sub = 0.9 / 2 = 0.45
+    constexpr float DT_SUB = 0.45f;
+
+    for (int sub = 0; sub < 2; ++sub) {
+        bool subPressed = justPressed && (sub == 0);
+        bool subReleased = justReleased && (sub == 0);
+        float dy = 0.f;
+
+        switch (s.mode) {
+            case VehicleMode::Cube: {
+                if ((subPressed || s.holding) && s.onGround) {
+                    s.vyPerFrame = -gravDir * (11.180032f * sizeFactor);
+                    s.onGround = false;
+                }
+                s.vyPerFrame += gravDir * (0.958199f * sizeFactor * DT_SUB);
+                s.vyPerFrame = std::clamp(s.vyPerFrame, -15.f, 15.f);
+                dy = s.vyPerFrame * DT_SUB;
+                break;
             }
-            s.vyPerFrame += gravDir * (0.958f * sizeFactor);
-            s.vyPerFrame = std::clamp(s.vyPerFrame, -15.f, 15.f);
-            break;
-        }
-        case VehicleMode::Ship: {
-            float accel = s.holding ? (-gravDir * 0.46f) : (gravDir * 0.38f);
-            s.vyPerFrame += accel * sizeFactor;
-            s.vyPerFrame = std::clamp(s.vyPerFrame, -8.5f, 8.5f);
-            break;
-        }
-        case VehicleMode::Ball: {
-            if (justPressed && s.onGround) {
-                s.upsideDown = !s.upsideDown;
-                gravDir = s.upsideDown ? 1.f : -1.f;
-                s.vyPerFrame = gravDir * 2.5f;
-                s.onGround = false;
+            case VehicleMode::Ship: {
+                float accel = s.holding ? (-gravDir * 0.48f) : (gravDir * 0.40f);
+                s.vyPerFrame += accel * sizeFactor * DT_SUB;
+                s.vyPerFrame = std::clamp(s.vyPerFrame, -8.5f, 8.5f);
+                dy = s.vyPerFrame * DT_SUB;
+                break;
             }
-            s.vyPerFrame += gravDir * (0.78f * sizeFactor);
-            s.vyPerFrame = std::clamp(s.vyPerFrame, -12.f, 12.f);
-            break;
-        }
-        case VehicleMode::UFO: {
-            if (justPressed) {
-                s.vyPerFrame = -gravDir * (9.2f * sizeFactor);
-                s.onGround = false;
+            case VehicleMode::Ball: {
+                if (subPressed && s.onGround) {
+                    s.upsideDown = !s.upsideDown;
+                    gravDir = s.upsideDown ? 1.f : -1.f;
+                    s.vyPerFrame = gravDir * 2.5f;
+                    s.onGround = false;
+                }
+                s.vyPerFrame += gravDir * (0.78f * sizeFactor * DT_SUB);
+                s.vyPerFrame = std::clamp(s.vyPerFrame, -12.f, 12.f);
+                dy = s.vyPerFrame * DT_SUB;
+                break;
             }
-            s.vyPerFrame += gravDir * (0.78f * sizeFactor);
-            s.vyPerFrame = std::clamp(s.vyPerFrame, -11.5f, 11.5f);
-            break;
-        }
-        case VehicleMode::Wave: {
-            float slope = s.mini ? 2.0f : 1.0f;
-            float dir = s.holding ? -gravDir : gravDir;
-            s.vyPerFrame = dir * s.vxPerFrame * slope;
-            break;
-        }
-        case VehicleMode::Robot: {
-            if (justPressed && s.onGround) {
-                s.vyPerFrame = -gravDir * (8.8f * sizeFactor);
-                s.onGround = false;
-            } else if (s.holding && (-gravDir * s.vyPerFrame) > 0.f) {
-                s.vyPerFrame += -gravDir * (0.45f * sizeFactor);
+            case VehicleMode::UFO: {
+                if (subPressed) {
+                    s.vyPerFrame = -gravDir * (9.2f * sizeFactor);
+                    s.onGround = false;
+                }
+                s.vyPerFrame += gravDir * (0.78f * sizeFactor * DT_SUB);
+                s.vyPerFrame = std::clamp(s.vyPerFrame, -11.5f, 11.5f);
+                dy = s.vyPerFrame * DT_SUB;
+                break;
             }
-            if (justReleased && (-gravDir * s.vyPerFrame) > 3.f) {
-                s.vyPerFrame *= 0.55f;
+            case VehicleMode::Wave: {
+                float slope = s.mini ? 2.0f : 1.0f;
+                float dir = s.holding ? -gravDir : gravDir;
+                dy = dir * (s.vxPerFrame * 0.5f) * slope;
+                s.vyPerFrame = dy / DT_SUB;
+                break;
             }
-            s.vyPerFrame += gravDir * (0.92f * sizeFactor);
-            s.vyPerFrame = std::clamp(s.vyPerFrame, -15.f, 15.f);
-            break;
-        }
-        case VehicleMode::Spider: {
-            if (justPressed && s.onGround) {
-                s.upsideDown = !s.upsideDown;
-                float searchDir = s.upsideDown ? 1.f : -1.f;
-                float bestY = s.y + searchDir * 120.f;
-                float bestDist = 9999.f;
-                for (auto const& box : solids) {
-                    if (s.x + s.halfW < box.getMinX() || s.x - s.halfW > box.getMaxX()) continue;
-                    if (searchDir > 0.f && box.getMinY() >= s.y) {
-                        float d = box.getMinY() - s.y;
-                        if (d < bestDist) {
-                            bestDist = d;
-                            bestY = box.getMinY() - s.halfH;
-                        }
-                    } else if (searchDir < 0.f && box.getMaxY() <= s.y) {
-                        float d = s.y - box.getMaxY();
-                        if (d < bestDist) {
-                            bestDist = d;
-                            bestY = box.getMaxY() + s.halfH;
+            case VehicleMode::Robot: {
+                if (subPressed && s.onGround) {
+                    s.vyPerFrame = -gravDir * (8.8f * sizeFactor);
+                    s.onGround = false;
+                } else if (s.holding && (-gravDir * s.vyPerFrame) > 0.f) {
+                    s.vyPerFrame += -gravDir * (0.45f * sizeFactor * DT_SUB);
+                }
+                if (subReleased && (-gravDir * s.vyPerFrame) > 3.f) {
+                    s.vyPerFrame *= 0.55f;
+                }
+                s.vyPerFrame += gravDir * (0.92f * sizeFactor * DT_SUB);
+                s.vyPerFrame = std::clamp(s.vyPerFrame, -15.f, 15.f);
+                dy = s.vyPerFrame * DT_SUB;
+                break;
+            }
+            case VehicleMode::Spider: {
+                if (subPressed && s.onGround) {
+                    s.upsideDown = !s.upsideDown;
+                    gravDir = s.upsideDown ? 1.f : -1.f;
+                    float searchDir = gravDir;
+                    float bestY = s.y + searchDir * 120.f;
+                    float bestDist = 9999.f;
+                    for (auto const& box : solids) {
+                        if (s.x + s.halfW < box.getMinX() || s.x - s.halfW > box.getMaxX()) continue;
+                        if (searchDir > 0.f && box.getMinY() >= s.y) {
+                            float d = box.getMinY() - s.y;
+                            if (d < bestDist) {
+                                bestDist = d;
+                                bestY = box.getMinY() - s.halfH;
+                            }
+                        } else if (searchDir < 0.f && box.getMaxY() <= s.y) {
+                            float d = s.y - box.getMaxY();
+                            if (d < bestDist) {
+                                bestDist = d;
+                                bestY = box.getMaxY() + s.halfH;
+                            }
                         }
                     }
+                    s.y = bestY;
+                    s.vyPerFrame = 0.f;
+                    s.onGround = true;
+                    dy = 0.f;
+                } else {
+                    s.vyPerFrame += gravDir * (0.958199f * sizeFactor * DT_SUB);
+                    s.vyPerFrame = std::clamp(s.vyPerFrame, -15.f, 15.f);
+                    dy = s.vyPerFrame * DT_SUB;
                 }
-                s.y = bestY;
-                s.vyPerFrame = 0.f;
-                s.onGround = true;
-            } else {
-                s.vyPerFrame += gravDir * (0.958f * sizeFactor);
-                s.vyPerFrame = std::clamp(s.vyPerFrame, -15.f, 15.f);
+                break;
             }
-            break;
-        }
-        case VehicleMode::Swing: {
-            if (justPressed) {
-                s.upsideDown = !s.upsideDown;
-                gravDir = s.upsideDown ? 1.f : -1.f;
+            case VehicleMode::Swing: {
+                if (subPressed) {
+                    s.upsideDown = !s.upsideDown;
+                    gravDir = s.upsideDown ? 1.f : -1.f;
+                }
+                s.vyPerFrame += gravDir * (0.48f * sizeFactor * DT_SUB);
+                s.vyPerFrame = std::clamp(s.vyPerFrame, -9.f, 9.f);
+                dy = s.vyPerFrame * DT_SUB;
+                break;
             }
-            s.vyPerFrame += gravDir * (0.48f * sizeFactor);
-            s.vyPerFrame = std::clamp(s.vyPerFrame, -9.f, 9.f);
-            break;
-        }
-    }
-
-    float prevX = s.x;
-    float prevY = s.y;
-    s.x += s.vxPerFrame;
-    s.y += s.vyPerFrame;
-    s.onGround = false;
-
-    // Piso base del nivel (y = 0)
-    if (!s.upsideDown && s.y - s.halfH <= 0.f) {
-        s.y = s.halfH;
-        s.vyPerFrame = 0.f;
-        s.onGround = true;
-    }
-
-    // Colisiones con bloques solidos (aterrizaje seguro vs choque frontal/techo)
-    CCRect pRect(s.x - s.halfW, s.y - s.halfH, s.halfW * 2.f, s.halfH * 2.f);
-    for (auto const& box : solids) {
-        if (!pRect.intersectsRect(box)) continue;
-
-        // Wave muere al tocar cualquier bloque solido
-        if (s.mode == VehicleMode::Wave) {
-            return true;
         }
 
-        // Aterrizaje por arriba (gravedad normal)
-        if (!s.upsideDown && prevY - s.halfH >= box.getMaxY() - 10.f && s.vyPerFrame <= 0.f) {
-            s.y = box.getMaxY() + s.halfH;
+        float prevX = s.x;
+        float prevY = s.y;
+        s.x += s.vxPerFrame * 0.5f;
+        s.y += dy;
+        s.onGround = false;
+
+        // Piso base del nivel (y = 0)
+        if (!s.upsideDown && s.y - s.halfH <= s.floorY) {
+            s.y = s.floorY + s.halfH;
             s.vyPerFrame = 0.f;
             s.onGround = true;
-            continue;
-        }
-        // Aterrizaje por abajo (gravedad invertida)
-        if (s.upsideDown && prevY + s.halfH <= box.getMinY() + 10.f && s.vyPerFrame >= 0.f) {
-            s.y = box.getMinY() - s.halfH;
-            s.vyPerFrame = 0.f;
-            s.onGround = true;
-            continue;
         }
 
-        // En Ship/UFO/Ball/Swing, rozar techo/suelo desliza; solo choque frontal mata
-        bool canSlideCeiling = (
-            s.mode == VehicleMode::Ship ||
-            s.mode == VehicleMode::UFO ||
-            s.mode == VehicleMode::Ball ||
-            s.mode == VehicleMode::Swing
-        );
-        if (canSlideCeiling) {
-            if (!s.upsideDown && prevY + s.halfH <= box.getMinY() + 10.f && s.vyPerFrame >= 0.f) {
-                s.y = box.getMinY() - s.halfH;
-                s.vyPerFrame = 0.f;
-                continue;
+        // Colisiones con bloques solidos
+        CCRect pRect(s.x - s.halfW, s.y - s.halfH, s.halfW * 2.f, s.halfH * 2.f);
+        for (auto const& box : solids) {
+            if (!pRect.intersectsRect(box)) continue;
+
+            if (s.mode == VehicleMode::Wave) {
+                return true;
             }
-            if (s.upsideDown && prevY - s.halfH >= box.getMaxY() - 10.f && s.vyPerFrame <= 0.f) {
+
+            if (!s.upsideDown && prevY - s.halfH >= box.getMaxY() - 10.f && dy <= 0.f) {
                 s.y = box.getMaxY() + s.halfH;
                 s.vyPerFrame = 0.f;
+                s.onGround = true;
                 continue;
             }
-        }
+            if (s.upsideDown && prevY + s.halfH <= box.getMinY() + 10.f && dy >= 0.f) {
+                s.y = box.getMinY() - s.halfH;
+                s.vyPerFrame = 0.f;
+                s.onGround = true;
+                continue;
+            }
 
-        // Choque lateral frontal contra pared del bloque (o techo en Cube/Robot/Spider)
-        float innerHalfH = s.halfH * 0.65f;
-        bool verticalCoreOverlap = (s.y + innerHalfH > box.getMinY() + 2.f) &&
-                                   (s.y - innerHalfH < box.getMaxY() - 2.f);
-        bool hitFrontWall = (prevX + s.halfW <= box.getMinX() + s.vxPerFrame + 5.f);
-        if (verticalCoreOverlap || hitFrontWall || !canSlideCeiling) {
-            return true;
+            bool canSlideCeiling = (
+                s.mode == VehicleMode::Ship ||
+                s.mode == VehicleMode::UFO ||
+                s.mode == VehicleMode::Ball ||
+                s.mode == VehicleMode::Swing
+            );
+            if (canSlideCeiling) {
+                if (!s.upsideDown && prevY + s.halfH <= box.getMinY() + 10.f && dy >= 0.f) {
+                    s.y = box.getMinY() - s.halfH;
+                    s.vyPerFrame = 0.f;
+                    continue;
+                }
+                if (s.upsideDown && prevY - s.halfH >= box.getMaxY() - 10.f && dy <= 0.f) {
+                    s.y = box.getMaxY() + s.halfH;
+                    s.vyPerFrame = 0.f;
+                    continue;
+                }
+            }
+
+            float innerHalfH = s.halfH * 0.65f;
+            bool verticalCoreOverlap = (s.y + innerHalfH > box.getMinY() + 2.f) &&
+                                       (s.y - innerHalfH < box.getMaxY() - 2.f);
+            bool hitFrontWall = (prevX + s.halfW <= box.getMinX() + s.vxPerFrame + 5.f);
+            if (verticalCoreOverlap || hitFrontWall || !canSlideCeiling) {
+                return true;
+            }
         }
     }
 
@@ -761,6 +791,18 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
         size_t cachedObjectCount = 0;
         std::deque<PendingAction> pendingQueue;
 
+        // Medicion real de velocidad horizontal por frame (60 FPS)
+        float lastPlayerX = 0.f;
+        bool hasLastX = false;
+        float measuredVxPerFrame = 0.f;
+
+        // Diagnostico en vivo para HUD
+        int inputHookCount = 0;
+        int lastButtonArg = -1;
+        bool lastIsP1Arg = true;
+        int lastDecisionDelay = 0;
+        std::string lastDecisionReason = "OK";
+
         std::vector<GameObject*> hazards;
         std::vector<GameObject*> solids;
         std::vector<GameObject*> orbs;
@@ -810,6 +852,10 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
         m_fields->currentFrame60 = 0;
         m_fields->actualHolding = false;
         m_fields->pendingQueue.clear();
+        m_fields->hasLastX = false;
+        m_fields->measuredVxPerFrame = 0.f;
+        m_fields->lastDecisionDelay = 0;
+        m_fields->lastDecisionReason = "OK";
     }
 
     void gatherNearbyRects(
@@ -850,12 +896,14 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
 
         bool tapMode = actionDown && isTapVehicle(s.mode);
 
+        // Colchon de seguridad alrededor del jugador para evitar roces mortales en espinas
+        constexpr float SAFETY_PAD = 3.5f;
+
         for (int f = 0; f <= commonHorizon; ++f) {
             bool justPressed = (f == delayFrames && actionDown);
             bool justReleased = (f == delayFrames && !actionDown);
 
-            // Para vehiculos de toque (Cube/Ball/UFO/Spider/Swing), simular un toque limpio
-            // soltando 2 frames despues para no provocar saltos automaticos falsos en la prediccion
+            // Para vehiculos de toque, simular liberacion limpia 2 frames despues
             if (tapMode && f == delayFrames + 2) {
                 justReleased = true;
             }
@@ -881,9 +929,8 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
                 return result;
             }
 
-            // Hitbox de espinas del jugador ligeramente interior
-            float hx = s.halfW * 0.85f;
-            float hy = s.halfH * 0.85f;
+            float hx = s.halfW + SAFETY_PAD;
+            float hy = s.halfH + SAFETY_PAD;
             CCRect hazardCheckRect(s.x - hx, s.y - hy, hx * 2.f, hy * 2.f);
             for (auto const& hz : nearHazards) {
                 if (hazardCheckRect.intersectsRect(hz)) {
@@ -900,9 +947,9 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
     DelayDecision findBestDelayFrame(bool actionDown, int marginFrames, int lookaheadFrames) {
         ensureSpatialCache();
 
-        SimState initial = captureState(m_player1, m_fields->actualHolding);
-        int commonHorizon = marginFrames + std::max(lookaheadFrames, 24);
-        float maxDist = initial.vxPerFrame * static_cast<float>(commonHorizon + 12);
+        SimState initial = captureState(m_player1, m_fields->actualHolding, m_fields->measuredVxPerFrame);
+        int commonHorizon = marginFrames + std::max(lookaheadFrames, 26);
+        float maxDist = initial.vxPerFrame * static_cast<float>(commonHorizon + 14);
         float minX = initial.x - 60.f;
         float maxX = initial.x + maxDist;
 
@@ -913,9 +960,8 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
         gatherNearbyRects(m_fields->solids, minX, maxX, nearSolids, false);
         gatherNearbyRects(m_fields->orbs, minX, maxX, nearOrbs, false);
 
-        // Si no hay obstaculos en rango y no estamos cayendo al suelo para saltar, actuar ya
         if (nearHazards.empty() && nearSolids.empty() && nearOrbs.empty()) {
-            return {0, true};
+            return {0, true, "LIBRE"};
         }
 
         // 1. Evaluar delay = 0 (ejecutar ahora mismo)
@@ -924,7 +970,7 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
             nearHazards, nearSolids, nearOrbs
         );
         if (nowOut.survivedAll && nowOut.actionEffective) {
-            return {0, true};
+            return {0, true, "SAFE0"};
         }
 
         // 2. Evaluar todos los delays dentro del margen [1 .. marginFrames]
@@ -949,7 +995,6 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
                 firstSafeAny = delay;
             }
 
-            // Registrar la trayectoria que sobrevive mas frames si ningun delay cubre todo el horizonte
             bool betterSurvival = (out.survivalFrames > bestSurviveFrames) ||
                                   (out.survivalFrames == bestSurviveFrames &&
                                    out.actionEffective && !bestSurviveEffective);
@@ -960,39 +1005,48 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
             }
         }
 
-        // Si existe ventana segura efectiva, tomar el inicio + 1 frame de margen si la ventana lo permite
+        // Elegir el centro/inicio seguro de la ventana valida
         if (firstSafeEffective >= 0) {
             int chosen = firstSafeEffective;
             if (lastSafeEffective - firstSafeEffective >= 2) {
                 chosen = firstSafeEffective + 1;
             }
-            return {chosen, false};
+            return {chosen, false, "VENTANA"};
         }
 
-        // Si existe algun delay seguro aunque no efectivo (ej. evitar muerte inmediata)
         if (firstSafeAny >= 0) {
-            return {firstSafeAny, false};
+            return {firstSafeAny, false, "ESQUIVA"};
         }
 
-        // Si ningun delay sobrevive todo el horizonte (hay otro obstaculo mas adelante),
-        // retrasar si gana al menos 2 frames reales de supervivencia respecto a actuar ahora
         if (bestSurviveDelay > 0 && bestSurviveFrames >= nowOut.survivalFrames + 2) {
-            return {bestSurviveDelay, false};
+            return {bestSurviveDelay, false, "SUPERV"};
         }
 
-        return {0, nowOut.survivedAll};
+        return {0, nowOut.survivedAll, "SIN_ALT"};
     }
 
     void dispatchButton(bool down, int button, bool isPlayer1) {
-        if (isPlayer1 && button == 1) {
+        if (button == 1 || button == 0) {
             m_fields->actualHolding = down;
         }
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
     }
 
     void handleButton(bool down, int button, bool isPlayer1) {
-        // Evitar recursividad al disparar nuestras acciones retenidas
-        if (m_fields->isDispatchingBuffered || !isPlayer1 || button != 1 || !isAssistActive()) {
+        // Evitar recursividad al disparar acciones retenidas
+        if (m_fields->isDispatchingBuffered) {
+            dispatchButton(down, button, isPlayer1);
+            return;
+        }
+
+        // Registrar diagnostico de cada entrada real que llega a handleButton
+        m_fields->inputHookCount++;
+        m_fields->lastButtonArg = button;
+        m_fields->lastIsP1Arg = isPlayer1;
+
+        // NOTA ANDROID: No filtrar por !isPlayer1 porque en pantalla tactil
+        // tocar la mitad derecha puede enviar isPlayer1 = false incluso en modo 1 jugador.
+        if ((button != 1 && button != 0) || !isAssistActive()) {
             dispatchButton(down, button, isPlayer1);
             return;
         }
@@ -1002,11 +1056,9 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
         int margin = static_cast<int>(Mod::get()->getSettingValue<int64_t>("margin-frames"));
         int lookahead = static_cast<int>(Mod::get()->getSettingValue<int64_t>("lookahead-frames"));
 
-        // CASO CLAVE EN ANDROID (toque rapido):
-        // Si ya tenemos un CLIC esperando en la cola y el usuario levanta el dedo antes de que dispare,
-        // NO cancelar el clic pendiente: encolar el SOLTAR detras para que el salto se ejecute completo.
+        // Toque rapido en Android: si ya hay un CLIC esperando y el dedo se levanta antes de disparar,
+        // encolar el SOLTAR detras para que no cancele el salto pendiente.
         if (!down && !m_fields->pendingQueue.empty() && m_fields->pendingQueue.front().down) {
-            // Evitar duplicar releases seguidos
             if (m_fields->pendingQueue.back().down) {
                 PendingAction rel;
                 rel.down = false;
@@ -1021,8 +1073,7 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
             return;
         }
 
-        // Si habia un SOLTAR esperando y el usuario vuelve a presionar, descartar el soltar pendiente
-        // y continuar manteniendo si ya estaba presionado
+        // Si habia un SOLTAR esperando y el jugador vuelve a tocar, cancelar el soltar pendiente
         if (down && !m_fields->pendingQueue.empty() && !m_fields->pendingQueue.front().down) {
             m_fields->pendingQueue.clear();
             if (m_fields->actualHolding) {
@@ -1037,6 +1088,8 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
         }
 
         DelayDecision decision = findBestDelayFrame(down, margin, lookahead);
+        m_fields->lastDecisionDelay = decision.delay;
+        m_fields->lastDecisionReason = decision.reason;
 
         if (decision.delay <= 0) {
             m_fields->pendingQueue.clear();
@@ -1060,6 +1113,27 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
     void tickFrameAssist(float dt) {
         ensureSpatialCache();
 
+        // Medir velocidad horizontal real del jugador en px/frame (60 FPS)
+        if (m_player1 && dt > 0.0005f && dt < 0.15f) {
+            float curX = m_player1->getPositionX();
+            if (m_fields->hasLastX) {
+                float dx = curX - m_fields->lastPlayerX;
+                if (dx > 0.01f && dx < 120.f) {
+                    float instVx60 = (dx / dt) / static_cast<float>(REF_FPS);
+                    if (instVx60 > 1.5f && instVx60 < 18.f) {
+                        if (m_fields->measuredVxPerFrame <= 0.f) {
+                            m_fields->measuredVxPerFrame = instVx60;
+                        } else {
+                            m_fields->measuredVxPerFrame =
+                                m_fields->measuredVxPerFrame * 0.7f + instVx60 * 0.3f;
+                        }
+                    }
+                }
+            }
+            m_fields->lastPlayerX = curX;
+            m_fields->hasLastX = true;
+        }
+
         m_fields->elapsedTime += static_cast<double>(dt);
         int newFrame = static_cast<int>(m_fields->elapsedTime * REF_FPS);
 
@@ -1081,15 +1155,12 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
         bool shouldTrigger = false;
 
         if (front.quickTapRelease) {
-            // Liberacion automatica de un toque rapido tras ejecutarse el salto diferido
             if (newFrame >= front.targetFrame) {
                 shouldTrigger = true;
             }
         } else if (newFrame >= front.expireFrame) {
-            // Se alcanzo el limite del margen (ej. 16 frames): ejecutar la accion ahora
             shouldTrigger = true;
         } else {
-            // Reevaluar en tiempo real con la posicion exacta del jugador
             DelayDecision live = findBestDelayFrame(front.down, remainingMargin, lookahead);
             if (live.delay == 0 && (live.delayZeroSafe || newFrame >= front.targetFrame)) {
                 shouldTrigger = true;
@@ -1102,7 +1173,6 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
             PendingAction action = front;
             m_fields->pendingQueue.pop_front();
 
-            // Si queda un SOLTAR detras de un CLIC recien ejecutado, ajustar su ventana desde este frame
             if (!m_fields->pendingQueue.empty() && action.down && !m_fields->pendingQueue.front().down) {
                 int margin = static_cast<int>(Mod::get()->getSettingValue<int64_t>("margin-frames"));
                 auto& nextRel = m_fields->pendingQueue.front();
@@ -1122,13 +1192,13 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
         }
     }
 
-    int getCurrentFrame60() {
-        return m_fields->currentFrame60;
-    }
-
-    size_t getHazardCount() {
-        return m_fields->hazards.size();
-    }
+    int getCurrentFrame60() { return m_fields->currentFrame60; }
+    size_t getHazardCount() { return m_fields->hazards.size(); }
+    int getInputHookCount() { return m_fields->inputHookCount; }
+    int getLastButtonArg() { return m_fields->lastButtonArg; }
+    bool getLastIsP1Arg() { return m_fields->lastIsP1Arg; }
+    int getLastDecisionDelay() { return m_fields->lastDecisionDelay; }
+    std::string getLastDecisionReason() { return m_fields->lastDecisionReason; }
 
     bool hasPendingAction() {
         return !m_fields->pendingQueue.empty();
@@ -1157,11 +1227,11 @@ class $modify(FrameAssistPlayLayer, PlayLayer) {
         if (Mod::get()->getSettingValue<bool>("mod-enabled") &&
             Mod::get()->getSettingValue<bool>("show-hud")) {
             auto winSize = CCDirector::get()->getWinSize();
-            auto hud = CCLabelBMFont::create("F:0 | Cube | H:0 | LISTO", "bigFont.fnt");
+            auto hud = CCLabelBMFont::create("F:0 | Cube | H:0 | I:0 | LISTO", "bigFont.fnt");
             hud->setID("frame-assist-hud"_spr);
             hud->setAnchorPoint({0.f, 1.f});
-            hud->setScale(0.28f);
-            hud->setOpacity(185);
+            hud->setScale(0.26f);
+            hud->setOpacity(195);
             hud->setPosition({8.f, winSize.height - 6.f});
             this->addChild(hud, 100);
             m_fields->hudLabel = hud;
@@ -1192,23 +1262,30 @@ class $modify(FrameAssistPlayLayer, PlayLayer) {
             if (base->hasPendingAction()) {
                 auto pending = base->getFrontPendingAction();
                 stateStr = fmt::format(
-                    "ESPERANDO {} -> F:{}",
+                    "ESP {}->F:{}",
                     pending.down ? "CLIC" : "SOLTAR",
                     pending.targetFrame
                 );
                 m_fields->hudLabel->setColor({255, 220, 90});
             } else {
-                stateStr = "LISTO";
+                stateStr = fmt::format(
+                    "D:{}({})",
+                    base->getLastDecisionDelay(),
+                    base->getLastDecisionReason()
+                );
                 m_fields->hudLabel->setColor({150, 255, 160});
             }
 
             m_fields->hudLabel->setString(fmt::format(
-                "F:{} | {} | H:{} | {}{}",
+                "F:{} {} H:{} I:{} B:{} P:{} {}{}",
                 base->getCurrentFrame60(),
                 vehicleName(mode),
                 base->getHazardCount(),
+                base->getInputHookCount(),
+                base->getLastButtonArg(),
+                base->getLastIsP1Arg() ? 1 : 0,
                 stateStr,
-                safeMode ? " [SAFE]" : ""
+                safeMode ? " [S]" : ""
             ).c_str());
         }
     }
@@ -1216,7 +1293,6 @@ class $modify(FrameAssistPlayLayer, PlayLayer) {
     void applySafeModeIfNeeded() {
         if (Mod::get()->getSettingValue<bool>("mod-enabled") &&
             Mod::get()->getSettingValue<bool>("safe-mode")) {
-            // m_isTestMode evita que GD registre progreso o estrellas mientras pruebas el mod
             m_isTestMode = true;
         }
     }

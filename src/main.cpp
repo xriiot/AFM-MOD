@@ -1,6 +1,6 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
-#include <Geode/modify/MenuLayer.hpp>
+#include <Geode/modify/PauseLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PlayerObject.hpp>
 #include <Geode/ui/Popup.hpp>
@@ -33,6 +33,14 @@ inline bool isGhostPlayer(PlayerObject* p) {
     return p != nullptr && (p == g_ghostPrefix || p == g_ghostProbe);
 }
 
+inline bool getShowTrajectorySetting() {
+    return Mod::get()->getSavedValue<bool>("show-trajectory", false);
+}
+
+inline void setShowTrajectorySetting(bool val) {
+    Mod::get()->setSavedValue<bool>("show-trajectory", val);
+}
+
 enum class VehicleMode {
     Cube,
     Ship,
@@ -60,14 +68,11 @@ struct ProbeOutcome {
     bool survivedAll = true;
     bool effective = true;
     int survivalTicks = 0;
-    float movedX = 0.f;
 };
 
 struct DelayDecision {
     int delayTicks = 0;
     bool fireNow = true;
-    int d0SurvivalTicks = 0;
-    int d0MovedX = 0;
     const char* reason = "OK";
 };
 
@@ -120,7 +125,6 @@ template <typename P>
 void copyFullPhysicsState(P* dst, P* src) {
     if (!dst || !src) return;
 
-    // Campos base confirmados en Geode v6.0.0
     dst->m_isShip = src->m_isShip;
     dst->m_isBall = src->m_isBall;
     dst->m_isBird = src->m_isBird;
@@ -135,7 +139,6 @@ void copyFullPhysicsState(P* dst, P* src) {
     dst->m_yVelocity = src->m_yVelocity;
     dst->m_isDead = false;
 
-    // Campos fisicos adicionales copiados de forma segura si existen en el binding actual
     if constexpr (requires { dst->m_gravityMod = src->m_gravityMod; }) dst->m_gravityMod = src->m_gravityMod;
     if constexpr (requires { dst->m_isLocked = false; }) dst->m_isLocked = false;
     if constexpr (requires { dst->m_isHidden = false; }) dst->m_isHidden = false;
@@ -226,13 +229,11 @@ bool isSpeedPortalID(int id) {
 }
 
 // Objetos de fisica que el fantasma SI puede activar (pads, orbes, portales de vehiculo/gravedad/tamano/velocidad)
-// Excluye triggers de nivel (Move, Toggle, Alpha, Spawn, SFX, End, Coins, Dual, Mirror, Teleport)
 bool isGhostInteractivePhysicsObject(GameObject* obj) {
     if (!obj) return false;
     auto type = obj->m_objectType;
     int rawType = static_cast<int>(type);
 
-    // SpiderPad (44) y GravityTogglePortal (42) por valor entero para maxima compatibilidad entre bindings
     if (rawType == 42 || rawType == 44) return true;
 
     switch (type) {
@@ -296,7 +297,7 @@ void restoreSnapshots(std::vector<ActivationSnapshot> const& snapshots) {
 } // namespace
 
 // ============================================================================
-// 1. VENTANA DE CONFIGURACION (Popup estilo Geometry Dash para Android)
+// 1. VENTANA DE CONFIGURACION (Se abre desde la tuerquita en PauseLayer)
 // ============================================================================
 class ModConfigPopup : public geode::Popup {
 protected:
@@ -307,30 +308,27 @@ protected:
     CCMenuItemToggler* m_pressToggle = nullptr;
     CCMenuItemToggler* m_releaseToggle = nullptr;
     CCMenuItemToggler* m_hudToggle = nullptr;
+    CCMenuItemToggler* m_trajToggle = nullptr;
     CCMenuItemToggler* m_practiceToggle = nullptr;
 
     Slider* m_marginSlider = nullptr;
     Slider* m_lookaheadSlider = nullptr;
-    Slider* m_scaleSlider = nullptr;
 
     CCLabelBMFont* m_marginValLabel = nullptr;
     CCLabelBMFont* m_lookaheadValLabel = nullptr;
-    CCLabelBMFont* m_scaleValLabel = nullptr;
 
     static constexpr int MIN_MARGIN = 1;
     static constexpr int MAX_MARGIN = 30;
     static constexpr int MIN_LOOKAHEAD = 8;
     static constexpr int MAX_LOOKAHEAD = 45;
-    static constexpr float MIN_SCALE = 0.7f;
-    static constexpr float MAX_SCALE = 1.4f;
 
     bool init(std::function<void()> onSettingsChanged) {
-        if (!Popup::init(415.f, 285.f)) {
+        if (!Popup::init(420.f, 286.f)) {
             return false;
         }
 
         m_onSettingsChanged = std::move(onSettingsChanged);
-        this->setTitle("Frame Assist (Ghost) - Config");
+        this->setTitle("Frame Assist - Configuracion");
 
         auto menu = CCMenu::create();
         menu->setPosition({0.f, 0.f});
@@ -338,40 +336,44 @@ protected:
 
         // --- Columna izquierda de interruptores ---
         m_enabledToggle = addCompactToggle(
-            menu, "Activar Mod", "mod-enabled", 22.f, 185.f, 224.f,
+            menu, "Activar Mod", "mod-enabled", 22.f, 188.f, 228.f,
             menu_selector(ModConfigPopup::onToggleEnabled)
         );
         m_pressToggle = addCompactToggle(
-            menu, "Asistir Clic (Press)", "buffer-press", 22.f, 185.f, 194.f,
+            menu, "Asistir Clic", "buffer-press", 22.f, 188.f, 200.f,
             menu_selector(ModConfigPopup::onTogglePress)
         );
         m_hudToggle = addCompactToggle(
-            menu, "HUD en Nivel", "show-hud", 22.f, 185.f, 164.f,
+            menu, "Mostrar HUD", "show-hud", 22.f, 188.f, 172.f,
             menu_selector(ModConfigPopup::onToggleHud)
+        );
+        m_practiceToggle = addCompactToggle(
+            menu, "Modo Practica", "enable-in-practice", 22.f, 188.f, 144.f,
+            menu_selector(ModConfigPopup::onTogglePractice)
         );
 
         // --- Columna derecha de interruptores ---
         m_safeModeToggle = addCompactToggle(
-            menu, "Modo Seguro", "safe-mode", 214.f, 386.f, 224.f,
+            menu, "Modo Seguro", "safe-mode", 216.f, 390.f, 228.f,
             menu_selector(ModConfigPopup::onToggleSafeMode)
         );
         m_releaseToggle = addCompactToggle(
-            menu, "Asistir Soltar", "buffer-release", 214.f, 386.f, 194.f,
+            menu, "Asistir Soltar", "buffer-release", 216.f, 390.f, 200.f,
             menu_selector(ModConfigPopup::onToggleRelease)
         );
-        m_practiceToggle = addCompactToggle(
-            menu, "Modo Practica", "enable-in-practice", 214.f, 386.f, 164.f,
-            menu_selector(ModConfigPopup::onTogglePractice)
+        m_trajToggle = addSavedToggle(
+            menu, "Ver Recorrido", getShowTrajectorySetting(), 216.f, 390.f, 172.f,
+            menu_selector(ModConfigPopup::onToggleTrajectory)
         );
 
         // --- Sliders principales ---
         int margin = static_cast<int>(Mod::get()->getSettingValue<int64_t>("margin-frames"));
         addSliderRow(
-            "Margen (60 FPS)",
+            "Margen Max",
             static_cast<float>(margin),
             static_cast<float>(MIN_MARGIN),
             static_cast<float>(MAX_MARGIN),
-            126.f,
+            104.f,
             fmt::format("{}f", margin),
             menu_selector(ModConfigPopup::onMarginChanged),
             m_marginSlider,
@@ -384,24 +386,11 @@ protected:
             static_cast<float>(lookahead),
             static_cast<float>(MIN_LOOKAHEAD),
             static_cast<float>(MAX_LOOKAHEAD),
-            94.f,
+            70.f,
             fmt::format("{}f", lookahead),
             menu_selector(ModConfigPopup::onLookaheadChanged),
             m_lookaheadSlider,
             m_lookaheadValLabel
-        );
-
-        float scale = static_cast<float>(Mod::get()->getSettingValue<double>("ui-scale"));
-        addSliderRow(
-            "Escala Panel",
-            scale,
-            MIN_SCALE,
-            MAX_SCALE,
-            62.f,
-            fmt::format("{:.0f}%", scale * 100.f),
-            menu_selector(ModConfigPopup::onScaleChanged),
-            m_scaleSlider,
-            m_scaleValLabel
         );
 
         // --- Boton Restablecer ---
@@ -410,7 +399,7 @@ protected:
         auto resetBtn = CCMenuItemSpriteExtra::create(
             resetSpr, this, menu_selector(ModConfigPopup::onResetDefaults)
         );
-        resetBtn->setPosition({m_size.width / 2.f, 25.f});
+        resetBtn->setPosition({m_size.width / 2.f, 26.f});
         menu->addChild(resetBtn);
 
         return true;
@@ -425,15 +414,30 @@ protected:
         float posY,
         SEL_MenuHandler callback
     ) {
+        return addSavedToggle(
+            menu, labelText, Mod::get()->getSettingValue<bool>(settingKey),
+            labelX, toggleX, posY, callback
+        );
+    }
+
+    CCMenuItemToggler* addSavedToggle(
+        CCMenu* menu,
+        const char* labelText,
+        bool initialState,
+        float labelX,
+        float toggleX,
+        float posY,
+        SEL_MenuHandler callback
+    ) {
         auto label = CCLabelBMFont::create(labelText, "bigFont.fnt");
         label->setAnchorPoint({0.f, 0.5f});
         label->setScale(0.36f);
         label->setPosition({labelX, posY});
         m_mainLayer->addChild(label);
 
-        auto toggler = CCMenuItemToggler::createWithStandardSprites(this, callback, 0.65f);
+        auto toggler = CCMenuItemToggler::createWithStandardSprites(this, callback, 0.64f);
         toggler->setPosition({toggleX, posY});
-        toggler->toggle(Mod::get()->getSettingValue<bool>(settingKey));
+        toggler->toggle(initialState);
         menu->addChild(toggler);
 
         return toggler;
@@ -452,12 +456,12 @@ protected:
     ) {
         auto label = CCLabelBMFont::create(labelText, "bigFont.fnt");
         label->setAnchorPoint({0.f, 0.5f});
-        label->setScale(0.39f);
+        label->setScale(0.40f);
         label->setPosition({22.f, posY});
         m_mainLayer->addChild(label);
 
-        outSlider = Slider::create(this, callback, 0.66f);
-        outSlider->setPosition({252.f, posY});
+        outSlider = Slider::create(this, callback, 0.72f);
+        outSlider->setPosition({250.f, posY});
         float norm = std::clamp((currentValue - minVal) / (maxVal - minVal), 0.f, 1.f);
         outSlider->setValue(norm);
         outSlider->updateBar();
@@ -465,8 +469,8 @@ protected:
 
         outValueLabel = CCLabelBMFont::create(initialText.c_str(), "goldFont.fnt");
         outValueLabel->setAnchorPoint({1.f, 0.5f});
-        outValueLabel->setScale(0.45f);
-        outValueLabel->setPosition({394.f, posY});
+        outValueLabel->setScale(0.48f);
+        outValueLabel->setPosition({398.f, posY});
         m_mainLayer->addChild(outValueLabel);
     }
 
@@ -486,6 +490,12 @@ protected:
     void onToggleRelease(CCObject* s)  { toggleSetting(s, "buffer-release"); }
     void onToggleHud(CCObject* s)      { toggleSetting(s, "show-hud"); }
     void onTogglePractice(CCObject* s) { toggleSetting(s, "enable-in-practice"); }
+
+    void onToggleTrajectory(CCObject* sender) {
+        auto toggler = static_cast<CCMenuItemToggler*>(sender);
+        setShowTrajectorySetting(!toggler->isToggled());
+        notifyChange();
+    }
 
     void onMarginChanged(CCObject*) {
         int val = static_cast<int>(std::round(
@@ -507,14 +517,6 @@ protected:
         notifyChange();
     }
 
-    void onScaleChanged(CCObject*) {
-        float val = MIN_SCALE + m_scaleSlider->getValue() * (MAX_SCALE - MIN_SCALE);
-        val = std::clamp(val, MIN_SCALE, MAX_SCALE);
-        Mod::get()->setSettingValue<double>("ui-scale", static_cast<double>(val));
-        m_scaleValLabel->setString(fmt::format("{:.0f}%", val * 100.f).c_str());
-        notifyChange();
-    }
-
     void onResetDefaults(CCObject*) {
         Mod::get()->setSettingValue<bool>("mod-enabled", true);
         Mod::get()->setSettingValue<bool>("safe-mode", true);
@@ -524,7 +526,7 @@ protected:
         Mod::get()->setSettingValue<bool>("enable-in-practice", true);
         Mod::get()->setSettingValue<int64_t>("margin-frames", 16);
         Mod::get()->setSettingValue<int64_t>("lookahead-frames", 24);
-        Mod::get()->setSettingValue<double>("ui-scale", 1.0);
+        setShowTrajectorySetting(false);
 
         m_enabledToggle->toggle(true);
         m_safeModeToggle->toggle(true);
@@ -532,6 +534,7 @@ protected:
         m_releaseToggle->toggle(true);
         m_hudToggle->toggle(true);
         m_practiceToggle->toggle(true);
+        m_trajToggle->toggle(false);
 
         m_marginSlider->setValue(static_cast<float>(16 - MIN_MARGIN) / (MAX_MARGIN - MIN_MARGIN));
         m_marginSlider->updateBar();
@@ -540,10 +543,6 @@ protected:
         m_lookaheadSlider->setValue(static_cast<float>(24 - MIN_LOOKAHEAD) / (MAX_LOOKAHEAD - MIN_LOOKAHEAD));
         m_lookaheadSlider->updateBar();
         m_lookaheadValLabel->setString("24f");
-
-        m_scaleSlider->setValue((1.0f - MIN_SCALE) / (MAX_SCALE - MIN_SCALE));
-        m_scaleSlider->updateBar();
-        m_scaleValLabel->setString("100%");
 
         notifyChange();
     }
@@ -561,116 +560,9 @@ public:
 };
 
 // ============================================================================
-// 2. PANEL VISUAL EN EL MENU PRINCIPAL (MenuLayer)
-// ============================================================================
-class $modify(FrameAssistMenuLayer, MenuLayer) {
-    struct Fields {
-        CCNode* panelContainer = nullptr;
-        CCLabelBMFont* statusLabel = nullptr;
-        CCLabelBMFont* infoLabel = nullptr;
-        CCMenuItemToggler* quickToggle = nullptr;
-    };
-
-    bool init() {
-        if (!MenuLayer::init()) return false;
-
-        auto winSize = CCDirector::get()->getWinSize();
-
-        auto panel = CCNode::create();
-        panel->setID("frame-assist-panel"_spr);
-        panel->setContentSize({168.f, 46.f});
-        panel->setAnchorPoint({0.f, 1.f});
-        panel->setPosition({12.f, winSize.height - 12.f});
-        this->addChild(panel, 50);
-        m_fields->panelContainer = panel;
-
-        auto bg = CCScale9Sprite::create("square02_001.png");
-        bg->setContentSize(panel->getContentSize());
-        bg->setPosition(panel->getContentSize() / 2.f);
-        bg->setOpacity(210);
-        panel->addChild(bg);
-
-        auto panelMenu = CCMenu::create();
-        panelMenu->setPosition({0.f, 0.f});
-        panel->addChild(panelMenu);
-
-        auto quickToggle = CCMenuItemToggler::createWithStandardSprites(
-            this, menu_selector(FrameAssistMenuLayer::onQuickToggle), 0.65f
-        );
-        quickToggle->setPosition({22.f, 23.f});
-        panelMenu->addChild(quickToggle);
-        m_fields->quickToggle = quickToggle;
-
-        auto clickArea = CCNode::create();
-        clickArea->setContentSize({120.f, 38.f});
-
-        auto statusLabel = CCLabelBMFont::create("Assist: ON", "bigFont.fnt");
-        statusLabel->setAnchorPoint({0.f, 0.5f});
-        statusLabel->setScale(0.36f);
-        statusLabel->setPosition({2.f, 26.f});
-        clickArea->addChild(statusLabel);
-        m_fields->statusLabel = statusLabel;
-
-        auto infoLabel = CCLabelBMFont::create("Ghost 16f | Config", "goldFont.fnt");
-        infoLabel->setAnchorPoint({0.f, 0.5f});
-        infoLabel->setScale(0.31f);
-        infoLabel->setPosition({2.f, 11.f});
-        clickArea->addChild(infoLabel);
-        m_fields->infoLabel = infoLabel;
-
-        auto gearIcon = CCSprite::createWithSpriteFrameName("GJ_optionsBtn_001.png");
-        gearIcon->setScale(0.4f);
-        gearIcon->setPosition({108.f, 19.f});
-        clickArea->addChild(gearIcon);
-
-        auto openBtn = CCMenuItemSpriteExtra::create(
-            clickArea, this, menu_selector(FrameAssistMenuLayer::onOpenConfig)
-        );
-        openBtn->setPosition({102.f, 23.f});
-        panelMenu->addChild(openBtn);
-
-        refreshPanelVisuals();
-        return true;
-    }
-
-    void refreshPanelVisuals() {
-        bool enabled = Mod::get()->getSettingValue<bool>("mod-enabled");
-        int margin = static_cast<int>(Mod::get()->getSettingValue<int64_t>("margin-frames"));
-        float scale = static_cast<float>(Mod::get()->getSettingValue<double>("ui-scale"));
-
-        if (m_fields->quickToggle) {
-            m_fields->quickToggle->toggle(enabled);
-        }
-        if (m_fields->statusLabel) {
-            m_fields->statusLabel->setString(enabled ? "Assist: ON" : "Assist: OFF");
-            m_fields->statusLabel->setColor(enabled ? ccColor3B{120, 255, 120} : ccColor3B{255, 110, 110});
-        }
-        if (m_fields->infoLabel) {
-            m_fields->infoLabel->setString(fmt::format("Ghost {}f | Config", margin).c_str());
-        }
-        if (m_fields->panelContainer) {
-            m_fields->panelContainer->setScale(std::clamp(scale, 0.7f, 1.4f));
-        }
-    }
-
-    void onQuickToggle(CCObject* sender) {
-        auto toggler = static_cast<CCMenuItemToggler*>(sender);
-        Mod::get()->setSettingValue<bool>("mod-enabled", !toggler->isToggled());
-        refreshPanelVisuals();
-    }
-
-    void onOpenConfig(CCObject*) {
-        auto popup = ModConfigPopup::create([this]() {
-            this->refreshPanelVisuals();
-        });
-        if (popup) popup->show();
-    }
-};
-
-// ============================================================================
-// 3. MOTOR FANTASMA CON FISICA REAL DEL JUEGO (GJBaseGameLayer)
-// Usa 2 PlayerObject invisibles (prefijo + sonda) ejecutando PlayerObject::update
-// y GJBaseGameLayer::checkCollisions a 240 TPS reales con horizonte comun.
+// 2. MOTOR FANTASMA CON FISICA REAL DEL JUEGO (GJBaseGameLayer)
+// Activacion ESTRICTA solo dentro de [1 .. marginFrames] (ej. 16 frames hacia abajo)
+// + renderizado de trayectoria en tiempo real con CCDrawNode.
 // ============================================================================
 class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
     struct Fields {
@@ -689,8 +581,6 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
 
         std::deque<PendingAction> pendingQueue;
         int lastDelayTicks = 0;
-        int lastD0Survival = 0;
-        int lastD0MovedX = 0;
         std::string lastReason = "LISTO";
 
         ~Fields() {
@@ -701,8 +591,6 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
         }
     };
 
-    // Unico hook de aislamiento necesario en GJBaseGameLayer: impide que el fantasma
-    // active triggers de nivel (Move, Toggle, SFX, End, Coins, Checkpoints)
     bool canBeActivatedByPlayer(PlayerObject* player, EffectGameObject* obj) {
         if (g_simulatingGhost || isGhostPlayer(player)) {
             return isGhostInteractivePhysicsObject(obj);
@@ -786,6 +674,10 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
         return m_fields->prefixGhost != nullptr && m_fields->probeGhost != nullptr;
     }
 
+    void clearPendingQueue() {
+        m_fields->pendingQueue.clear();
+    }
+
     void resetAssistState() {
         m_fields->elapsedTime = 0.0;
         m_fields->currentFrame60 = 0;
@@ -793,8 +685,6 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
         m_fields->savedInputsCount = 0;
         m_fields->pendingQueue.clear();
         m_fields->lastDelayTicks = 0;
-        m_fields->lastD0Survival = 0;
-        m_fields->lastD0MovedX = 0;
         m_fields->lastReason = "LISTO";
 
         if (m_fields->prefixGhost && m_fields->probeGhost) {
@@ -838,8 +728,7 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
         dst->setOpacity(0);
     }
 
-    // Avanza un PlayerObject fantasma exactamente 1 tick real de GD (1/240 s),
-    // sincronizando su posicion y ensuciando su hitbox antes y despues de checkCollisions.
+    // Avanza un PlayerObject fantasma exactamente 1 tick real de GD (1/240 s)
     bool stepGhostOneTick(PlayerObject* ghost) {
         g_ghostDied = false;
 
@@ -849,7 +738,6 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
         ghost->update(TICK_DT_60);
         if (g_ghostDied || ghost->m_isDead) return false;
 
-        // Sincronizar m_position <-> CCNode::position y marcar hitbox sucia para checkCollisions
         CCPoint afterPos = ghost->m_position;
         CCPoint afterNode = ghost->getPosition();
         if (afterPos.x != beforePos.x || afterPos.y != beforePos.y) {
@@ -862,28 +750,28 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
         this->checkCollisions(ghost, TICK_DT_60, false);
         if (g_ghostDied || ghost->m_isDead) return false;
 
-        // Reflejar cualquier ajuste de aterrizaje o teletransporte aplicado por checkCollisions
         ghost->setPosition(ghost->m_position);
         dirtyGhostRects(ghost);
         return true;
     }
 
-    // Simula una sonda desde `baseGhost` aplicando `actionDown` y corriendo exactamente `remainingTicks`
+    // Simula la accion `actionDown` desde `baseGhost` durante `lookaheadTicks`.
+    // En vehiculos de suelo (Cube/Robot/Ball/Spider), si el salto aterriza de forma segura
+    // y sobrevive 16 ticks (4 frames @ 60 FPS) en el suelo, el salto concluyo con exito
+    // y no culpa falsamente a obstaculos lejanos (> 16 frames despues).
     ProbeOutcome runProbeFromBase(
         PlayerObject* baseGhost,
         bool actionDown,
-        int remainingTicks,
+        int lookaheadTicks,
         std::vector<ActivationSnapshot> const& snapshots
     ) {
         auto* probe = m_fields->probeGhost;
         ProbeOutcome out;
         out.survivedAll = true;
         out.effective = true;
-        out.survivalTicks = remainingTicks;
-        out.movedX = 0.f;
+        out.survivalTicks = lookaheadTicks;
 
         syncGhostFrom(probe, baseGhost);
-        float startX = probe->m_position.x;
 
         VehicleMode modeBefore = detectVehicle(probe);
         bool onGroundBefore = probe->m_isOnGround;
@@ -891,13 +779,12 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
         double vyBefore = probe->m_yVelocity;
 
         if (actionDown) {
-            // Sincronizar orbes en contacto justo antes de pulsar el boton
             g_ghostDied = false;
             dirtyGhostRects(probe);
             this->checkCollisions(probe, 0.0f, false);
             if (g_ghostDied || probe->m_isDead) {
                 restoreSnapshots(snapshots);
-                return {false, false, 0, 0.f};
+                return {false, false, 0};
             }
 
             probe->releaseButton(PlayerButton::Jump);
@@ -906,7 +793,6 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
             probe->releaseButton(PlayerButton::Jump);
         }
 
-        // En vehiculos de suelo en el aire, verificar si el clic activo un orbe o cambio estado
         if (actionDown && isGroundVehicle(modeBefore) && !onGroundBefore) {
             bool vyChanged = std::fabs(probe->m_yVelocity - vyBefore) > 1.0;
             bool gravChanged = (probe->m_isUpsideDown != upsideBefore);
@@ -916,9 +802,11 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
         }
 
         bool simulateQuickTapRelease = actionDown && isTapVehicle(modeBefore);
+        bool checkLandingComplete = actionDown && isGroundVehicle(modeBefore);
+        bool leftGround = !probe->m_isOnGround;
+        int safeLandTicks = 0;
 
-        for (int t = 1; t <= remainingTicks; ++t) {
-            // Para vehiculos de toque, soltar 4 ticks despues para evitar saltos automaticos falsos
+        for (int t = 1; t <= lookaheadTicks; ++t) {
             if (simulateQuickTapRelease && t == 5) {
                 probe->releaseButton(PlayerButton::Jump);
             }
@@ -926,32 +814,47 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
             if (!stepGhostOneTick(probe)) {
                 out.survivedAll = false;
                 out.survivalTicks = t;
-                out.movedX = probe->m_position.x - startX;
                 restoreSnapshots(snapshots);
                 return out;
             }
 
-            // Detectar si un orbe o salto se disparo en los primeros 3 ticks
             if (actionDown && !out.effective && t <= 3) {
                 if (std::fabs(probe->m_yVelocity - vyBefore) > 2.5 ||
                     probe->m_isUpsideDown != upsideBefore) {
                     out.effective = true;
                 }
             }
+
+            // Salida temprana limpia al aterrizar tras un salto de suelo (solo si cambio de vehiculo no paso)
+            if (checkLandingComplete && detectVehicle(probe) == modeBefore) {
+                if (!probe->m_isOnGround) {
+                    leftGround = true;
+                    safeLandTicks = 0;
+                } else if (leftGround && t >= 12) {
+                    safeLandTicks++;
+                    // 16 ticks = 4 frames @ 60 FPS seguros en suelo tras aterrizar -> salto completado
+                    if (safeLandTicks >= 16) {
+                        out.survivedAll = true;
+                        out.survivalTicks = lookaheadTicks;
+                        restoreSnapshots(snapshots);
+                        return out;
+                    }
+                }
+            }
         }
 
-        out.movedX = probe->m_position.x - startX;
         restoreSnapshots(snapshots);
         return out;
     }
 
-    int computeBaseLookaheadTicks(VehicleMode mode, int lookaheadFramesSetting) {
+    int computeLookaheadTicks(VehicleMode mode, int lookaheadFramesSetting) {
         int ticks = std::clamp(lookaheadFramesSetting, 8, 45) * TICKS_PER_FRAME60;
         if (mode == VehicleMode::Cube || mode == VehicleMode::Robot) {
-            return std::max(ticks, 108); // ~27 frames a 60 FPS para cubrir un salto completo + aterrizaje
+            // Cubre 1 salto completo (~100 ticks) + margen de aterrizaje (~16 ticks)
+            return std::max(ticks, 116);
         }
         if (mode == VehicleMode::Wave || mode == VehicleMode::Ship) {
-            return std::clamp(ticks, 60, 120);
+            return std::clamp(ticks, 56, 112);
         }
         return std::max(ticks, 84);
     }
@@ -959,7 +862,6 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
     // Evaluacion rapida en vivo mientras una accion espera en la cola (solo 2 sondas: d=0 y d=2)
     bool evaluateLiveTrigger(
         bool actionDown,
-        int remainingMarginTicks,
         int lookaheadFramesSetting,
         bool& outNowSafe,
         bool& outNextSafe
@@ -970,12 +872,11 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
         ensureInteractiveCache();
 
         VehicleMode mode = detectVehicle(m_player1);
-        int baseLookahead = computeBaseLookaheadTicks(mode, lookaheadFramesSetting);
-        int commonHorizon = std::max(0, remainingMarginTicks) + baseLookahead;
+        int lookaheadTicks = computeLookaheadTicks(mode, lookaheadFramesSetting);
 
         float px = m_player1->m_position.x;
         std::vector<ActivationSnapshot> snapshots;
-        snapshotNearbyInteractive(px - 90.f, px + 950.f, snapshots);
+        snapshotNearbyInteractive(px - 90.f, px + 850.f, snapshots);
 
         g_simulatingGhost = true;
 
@@ -987,11 +888,9 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
             prefix->pushButton(PlayerButton::Jump);
         }
 
-        // Sonda 1: disparar YA (d = 0) sobre todo el horizonte comun
-        ProbeOutcome nowOut = runProbeFromBase(prefix, actionDown, commonHorizon, snapshots);
+        ProbeOutcome nowOut = runProbeFromBase(prefix, actionDown, lookaheadTicks, snapshots);
         outNowSafe = nowOut.survivedAll && nowOut.effective;
 
-        // Sonda 2: esperar 2 ticks mas (1 frame @ 120fps) sobre el mismo horizonte comun
         bool prefixAlive = true;
         for (int s = 0; s < 2; ++s) {
             if (!stepGhostOneTick(prefix)) {
@@ -1002,9 +901,7 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
         if (prefixAlive) {
             std::vector<ActivationSnapshot> afterPrefixSnaps = snapshots;
             for (auto& snap : afterPrefixSnaps) updateObjectSnapshot(snap);
-            ProbeOutcome nextOut = runProbeFromBase(
-                prefix, actionDown, std::max(16, commonHorizon - 2), afterPrefixSnaps
-            );
+            ProbeOutcome nextOut = runProbeFromBase(prefix, actionDown, lookaheadTicks, afterPrefixSnaps);
             outNextSafe = nextOut.survivedAll && nextOut.effective;
         } else {
             outNextSafe = false;
@@ -1015,8 +912,10 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
         return true;
     }
 
-    // Busqueda completa con horizonte COMUN (maxDelayTicks + baseLookahead) para que d=0
-    // y d=maxDelay se comparen exactamente hasta el mismo punto futuro del nivel.
+    // Busqueda ESTRICTA dentro de [0 .. maxDelayTicks] (ej. 16 frames hacia abajo).
+    // Si d = 0 ya es seguro -> ejecuta al instante.
+    // Si NO existe una ventana realmente segura y efectiva dentro de [1 .. maxDelayTicks]
+    // -> NO retiene el input (evita activarse antes de los 16 frames).
     DelayDecision findBestGhostDelay(
         bool actionDown,
         int maxDelayTicks,
@@ -1024,18 +923,17 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
         bool isAlreadyBuffered
     ) {
         if (!ensureGhosts()) {
-            return {0, true, 0, 0, "NO_GHOST"};
+            return {0, true, "NO_GHOST"};
         }
         ensureInteractiveCache();
 
         VehicleMode mode = detectVehicle(m_player1);
-        int baseLookahead = computeBaseLookaheadTicks(mode, lookaheadFramesSetting);
+        int lookaheadTicks = computeLookaheadTicks(mode, lookaheadFramesSetting);
         int clampedMax = std::clamp(maxDelayTicks, 0, 120);
-        int commonHorizon = clampedMax + baseLookahead;
 
         float px = m_player1->m_position.x;
         std::vector<ActivationSnapshot> snapshots;
-        snapshotNearbyInteractive(px - 90.f, px + 1100.f, snapshots);
+        snapshotNearbyInteractive(px - 90.f, px + 950.f, snapshots);
 
         auto startClock = std::chrono::steady_clock::now();
         g_simulatingGhost = true;
@@ -1043,34 +941,29 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
         auto* prefix = m_fields->prefixGhost;
         syncGhostFrom(prefix, m_player1);
 
-        // Configurar estado de retencion del prefijo mientras espera
         if (actionDown) {
             prefix->releaseButton(PlayerButton::Jump);
         } else {
             prefix->pushButton(PlayerButton::Jump);
         }
 
-        // 1. Evaluar d = 0 sobre todo el horizonte comun
-        ProbeOutcome nowOut = runProbeFromBase(prefix, actionDown, commonHorizon, snapshots);
-        int d0Surv = nowOut.survivalTicks;
-        int d0Dx = static_cast<int>(std::round(nowOut.movedX));
-
+        // 1. Evaluar d = 0 (ejecutar ahora mismo)
+        ProbeOutcome nowOut = runProbeFromBase(prefix, actionDown, lookaheadTicks, snapshots);
         if (!isAlreadyBuffered && nowOut.survivedAll && nowOut.effective) {
             restoreSnapshots(snapshots);
             g_simulatingGhost = false;
-            return {0, true, d0Surv, d0Dx, "SAFE0"};
+            return {0, true, "SAFE0"};
         }
 
         struct CandResult {
             int delayTicks;
             ProbeOutcome out;
-            int totalSurvivalTicks;
         };
         std::vector<CandResult> results;
         results.reserve(static_cast<size_t>(clampedMax / 4 + 4));
-        results.push_back({0, nowOut, nowOut.survivalTicks});
+        results.push_back({0, nowOut});
 
-        // Escaneo rapido cada 4 ticks (60 FPS -> maximo 16 sondas para margen de 16f)
+        // Escaneo en pasos de 4 ticks (1 frame @ 60 FPS) estrictamente hasta clampedMax (<= 16f)
         constexpr int STEP_TICKS = 4;
         std::vector<ActivationSnapshot> prefixStateSnaps = snapshots;
 
@@ -1098,17 +991,14 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
                 updateObjectSnapshot(snap);
             }
 
-            int remainingHorizon = std::max(baseLookahead, commonHorizon - d);
-            ProbeOutcome probeOut = runProbeFromBase(prefix, actionDown, remainingHorizon, prefixStateSnaps);
-            int totalSurv = probeOut.survivedAll ? commonHorizon : (d + probeOut.survivalTicks);
-            results.push_back({d, probeOut, totalSurv});
+            ProbeOutcome probeOut = runProbeFromBase(prefix, actionDown, lookaheadTicks, prefixStateSnaps);
+            results.push_back({d, probeOut});
         }
 
-        // Restaurar SIEMPRE el estado original de todos los pads/orbes/portales del nivel real
         restoreSnapshots(snapshots);
         g_simulatingGhost = false;
 
-        // Buscar la ventana contigua mas amplia de ticks seguros y efectivos
+        // Buscar la ventana contigua mas amplia de frames realmente SEGUROS Y EFECTIVOS dentro de [0 .. clampedMax]
         int bestStartIdx = -1;
         int bestEndIdx = -1;
         int bestWinLen = 0;
@@ -1140,44 +1030,125 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
                 chosenIdx = (bestEndIdx - bestStartIdx >= 2) ? (bestStartIdx + 1) : bestStartIdx;
             }
 
-            int chosenDelay = results[chosenIdx].delayTicks;
+            int chosenDelay = std::min(results[chosenIdx].delayTicks, clampedMax);
             if (isAlreadyBuffered && nowOut.survivedAll && nowOut.effective) {
                 bool nextUnsafe = (n > 1 && !results[1].out.survivedAll);
                 if (chosenDelay == 0 || nextUnsafe) {
-                    return {0, true, d0Surv, d0Dx, "GHOST_OK"};
+                    return {0, true, "GHOST_OK"};
                 }
             }
-            return {chosenDelay, chosenDelay == 0, d0Surv, d0Dx, "GHOST_WIN"};
+            return {chosenDelay, chosenDelay == 0, "GHOST_WIN"};
         }
 
-        // Respaldo 1: algun retraso sobrevive todo el horizonte comun
-        for (int idx = 1; idx < n; ++idx) {
-            if (results[idx].out.survivedAll) {
-                return {results[idx].delayTicks, false, d0Surv, d0Dx, "ESQUIVA"};
+        // ESTRICTO: si no existe un frame seguro dentro del margen (ej. <= 16 frames),
+        // NO retener el clic ni el soltado; ejecutar inmediatamente.
+        return {0, true, "FUERA_MARGEN"};
+    }
+
+    // Dibuja en vivo el recorrido futuro exacto del jugador en coordenadas del nivel
+    void renderPlayerTrajectory(CCDrawNode* drawNode) {
+        if (!drawNode) return;
+
+        bool enabled = Mod::get()->getSettingValue<bool>("mod-enabled");
+        bool showTraj = getShowTrajectorySetting();
+        if (!enabled || !showTraj || !isAssistActive() || !ensureGhosts()) {
+            drawNode->clear();
+            drawNode->setVisible(false);
+            return;
+        }
+
+        ensureInteractiveCache();
+        drawNode->setVisible(true);
+        drawNode->clear();
+
+        int lookaheadFrames = static_cast<int>(Mod::get()->getSettingValue<int64_t>("lookahead-frames"));
+        int trajTicks = std::clamp(lookaheadFrames * 3, 48, 96);
+
+        float px = m_player1->m_position.x;
+        std::vector<ActivationSnapshot> snapshots;
+        snapshotNearbyInteractive(px - 90.f, px + 850.f, snapshots);
+
+        g_simulatingGhost = true;
+
+        auto* probe = m_fields->probeGhost;
+        syncGhostFrom(probe, m_player1);
+
+        if (m_fields->actualHolding) {
+            probe->pushButton(PlayerButton::Jump);
+        } else {
+            probe->releaseButton(PlayerButton::Jump);
+        }
+
+        bool hasPending = !m_fields->pendingQueue.empty();
+        PendingAction frontPending;
+        int ticksToPending = -1;
+        bool pendingTapRelease = false;
+        if (hasPending) {
+            frontPending = m_fields->pendingQueue.front();
+            double dtToAct = std::max(0.0, frontPending.targetTime - m_fields->elapsedTime);
+            ticksToPending = std::clamp(static_cast<int>(std::round(dtToAct * PHYS_TPS)), 0, trajTicks);
+            pendingTapRelease = frontPending.down && isTapVehicle(detectVehicle(probe));
+        }
+
+        std::vector<CCPoint> pts;
+        pts.reserve(static_cast<size_t>(trajTicks / 2 + 4));
+        pts.push_back(probe->m_position);
+
+        bool died = false;
+        CCPoint deathPos = probe->m_position;
+        bool hasActionPos = false;
+        CCPoint actionPos = probe->m_position;
+
+        for (int t = 0; t < trajTicks; ++t) {
+            if (hasPending && t == ticksToPending) {
+                actionPos = probe->m_position;
+                hasActionPos = true;
+                if (frontPending.down) {
+                    dirtyGhostRects(probe);
+                    this->checkCollisions(probe, 0.0f, false);
+                    probe->releaseButton(PlayerButton::Jump);
+                    probe->pushButton(PlayerButton::Jump);
+                } else {
+                    probe->releaseButton(PlayerButton::Jump);
+                }
+            }
+            if (hasPending && pendingTapRelease && t == ticksToPending + 4) {
+                probe->releaseButton(PlayerButton::Jump);
+            }
+
+            if (!stepGhostOneTick(probe)) {
+                died = true;
+                deathPos = probe->m_position;
+                pts.push_back(deathPos);
+                break;
+            }
+
+            if ((t % 2) == 1 || t == trajTicks - 1) {
+                pts.push_back(probe->m_position);
             }
         }
 
-        // Respaldo 2: hay otro obstaculo mas adelante; retrasar si gana >= 8 ticks reales de supervivencia
-        int bestSurvDelay = 0;
-        int bestSurvTotal = results[0].totalSurvivalTicks;
-        bool bestSurvEff = results[0].out.effective;
-        for (int idx = 1; idx < n; ++idx) {
-            auto const& cand = results[idx];
-            bool better = (cand.totalSurvivalTicks > bestSurvTotal) ||
-                          (cand.totalSurvivalTicks == bestSurvTotal &&
-                           cand.out.effective && !bestSurvEff);
-            if (better) {
-                bestSurvTotal = cand.totalSurvivalTicks;
-                bestSurvDelay = cand.delayTicks;
-                bestSurvEff = cand.out.effective;
-            }
+        restoreSnapshots(snapshots);
+        g_simulatingGhost = false;
+
+        if (pts.size() < 2) return;
+
+        ccColor4F lineColor = hasPending
+            ? ccc4f(1.0f, 0.88f, 0.18f, 0.92f)   // Amarillo: trayectoria asistida en espera
+            : (died
+                ? ccc4f(1.0f, 0.25f, 0.25f, 0.92f) // Rojo: trayectoria actual va a chocar
+                : ccc4f(0.22f, 1.0f, 0.55f, 0.88f)); // Verde: trayectoria actual segura
+
+        for (size_t i = 0; i + 1 < pts.size(); ++i) {
+            drawNode->drawSegment(pts[i], pts[i + 1], 1.6f, lineColor);
         }
 
-        if (bestSurvDelay > 0 && bestSurvTotal >= results[0].totalSurvivalTicks + 8) {
-            return {bestSurvDelay, false, d0Surv, d0Dx, "SUPERV"};
+        if (hasActionPos) {
+            drawNode->drawDot(actionPos, 4.0f, ccc4f(0.2f, 0.95f, 1.0f, 0.95f));
         }
-
-        return {0, true, d0Surv, d0Dx, "SIN_ALT"};
+        if (died) {
+            drawNode->drawDot(deathPos, 4.5f, ccc4f(1.0f, 0.15f, 0.15f, 0.95f));
+        }
     }
 
     void dispatchButton(bool down, int button, bool isPlayer1) {
@@ -1239,11 +1210,9 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
 
         DelayDecision decision = findBestGhostDelay(down, maxDelayTicks, lookaheadFrames, false);
         m_fields->lastDelayTicks = decision.delayTicks;
-        m_fields->lastD0Survival = decision.d0SurvivalTicks;
-        m_fields->lastD0MovedX = decision.d0MovedX;
         m_fields->lastReason = decision.reason;
 
-        if (decision.fireNow || decision.delayTicks <= 0) {
+        if (decision.fireNow || decision.delayTicks <= 0 || decision.delayTicks > maxDelayTicks) {
             m_fields->pendingQueue.clear();
             dispatchButton(down, button, isPlayer1);
             return;
@@ -1255,8 +1224,11 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
         act.button = button;
         act.isPlayer1 = isPlayer1;
         act.createdTime = m_fields->elapsedTime;
-        act.targetTime = m_fields->elapsedTime + (static_cast<double>(decision.delayTicks) / PHYS_TPS);
         act.expireTime = m_fields->elapsedTime + marginSec;
+        act.targetTime = std::min(
+            m_fields->elapsedTime + (static_cast<double>(decision.delayTicks) / PHYS_TPS),
+            act.expireTime
+        );
         act.lastRescanTime = m_fields->elapsedTime;
         act.targetFrame60 = static_cast<int>(std::round(act.targetTime * REF_FPS));
         act.quickTapRelease = false;
@@ -1294,12 +1266,9 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
             shouldTrigger = true;
             m_fields->lastReason = "LIMITE";
         } else {
-            double remainingSec = std::max(0.0, front.expireTime - m_fields->elapsedTime);
-            int remainingTicks = static_cast<int>(std::ceil(remainingSec * PHYS_TPS));
-
             bool nowSafe = false;
             bool nextSafe = false;
-            evaluateLiveTrigger(front.down, remainingTicks, lookaheadFrames, nowSafe, nextSafe);
+            evaluateLiveTrigger(front.down, lookaheadFrames, nowSafe, nextSafe);
 
             if (nowSafe && (m_fields->elapsedTime >= front.targetTime || !nextSafe)) {
                 shouldTrigger = true;
@@ -1308,18 +1277,21 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
                 m_fields->lastReason = "GHOST_OK";
             } else if (m_fields->elapsedTime >= front.targetTime ||
                        (m_fields->elapsedTime - front.lastRescanTime) >= (1.0 / REF_FPS)) {
+                double remainingSec = std::max(0.0, front.expireTime - m_fields->elapsedTime);
+                int remainingTicks = static_cast<int>(std::floor(remainingSec * PHYS_TPS));
                 DelayDecision live = findBestGhostDelay(front.down, remainingTicks, lookaheadFrames, true);
                 front.lastRescanTime = m_fields->elapsedTime;
                 m_fields->lastDelayTicks = live.delayTicks;
-                m_fields->lastD0Survival = live.d0SurvivalTicks;
-                m_fields->lastD0MovedX = live.d0MovedX;
                 m_fields->lastReason = live.reason;
 
                 if (live.fireNow) {
                     shouldTrigger = true;
-                    wasSaved = true;
+                    wasSaved = (std::string(live.reason) == "GHOST_OK");
                 } else {
-                    front.targetTime = m_fields->elapsedTime + (static_cast<double>(live.delayTicks) / PHYS_TPS);
+                    front.targetTime = std::min(
+                        m_fields->elapsedTime + (static_cast<double>(live.delayTicks) / PHYS_TPS),
+                        front.expireTime
+                    );
                     front.targetFrame60 = static_cast<int>(std::round(front.targetTime * REF_FPS));
                 }
             }
@@ -1342,8 +1314,8 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
                     nextRel.targetFrame60 = static_cast<int>(std::round(nextRel.targetTime * REF_FPS));
                 } else {
                     nextRel.createdTime = m_fields->elapsedTime;
-                    nextRel.targetTime = m_fields->elapsedTime + (2.0 / PHYS_TPS);
                     nextRel.expireTime = m_fields->elapsedTime + marginSec;
+                    nextRel.targetTime = std::min(m_fields->elapsedTime + (2.0 / PHYS_TPS), nextRel.expireTime);
                     nextRel.lastRescanTime = m_fields->elapsedTime;
                     nextRel.targetFrame60 = static_cast<int>(std::round(nextRel.targetTime * REF_FPS));
                 }
@@ -1358,8 +1330,6 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
     int getCurrentFrame60() { return m_fields->currentFrame60; }
     int getSavedInputsCount() { return m_fields->savedInputsCount; }
     int getLastDelayTicks() { return m_fields->lastDelayTicks; }
-    int getLastD0Survival() { return m_fields->lastD0Survival; }
-    int getLastD0MovedX() { return m_fields->lastD0MovedX; }
     std::string getLastReason() { return m_fields->lastReason; }
 
     bool hasPendingAction() {
@@ -1373,11 +1343,12 @@ class $modify(FrameAssistGameLayer, GJBaseGameLayer) {
 };
 
 // ============================================================================
-// 4. INTEGRACION CON EL NIVEL Y HUD (PlayLayer)
+// 3. INTEGRACION CON EL NIVEL, HUD Y RECORRIDO (PlayLayer)
 // ============================================================================
 class $modify(FrameAssistPlayLayer, PlayLayer) {
     struct Fields {
         CCLabelBMFont* hudLabel = nullptr;
+        CCDrawNode* trajDraw = nullptr;
     };
 
     bool init(GJGameLevel* level, bool dontCreateObjects) {
@@ -1387,26 +1358,61 @@ class $modify(FrameAssistPlayLayer, PlayLayer) {
         base->resetAssistState();
         base->ensureInteractiveCache();
 
-        applySafeModeIfNeeded();
+        auto winSize = CCDirector::get()->getWinSize();
+        auto hud = CCLabelBMFont::create("F:0 Cube S:0 LISTO", "bigFont.fnt");
+        hud->setID("frame-assist-hud"_spr);
+        hud->setAnchorPoint({0.f, 1.f});
+        hud->setScale(0.26f);
+        hud->setOpacity(195);
+        hud->setPosition({8.f, winSize.height - 6.f});
+        this->addChild(hud, 100);
+        m_fields->hudLabel = hud;
 
-        if (Mod::get()->getSettingValue<bool>("mod-enabled") &&
-            Mod::get()->getSettingValue<bool>("show-hud")) {
-            auto winSize = CCDirector::get()->getWinSize();
-            auto hud = CCLabelBMFont::create("F:0 Cube S:0 GHOST", "bigFont.fnt");
-            hud->setID("frame-assist-hud"_spr);
-            hud->setAnchorPoint({0.f, 1.f});
-            hud->setScale(0.25f);
-            hud->setOpacity(195);
-            hud->setPosition({8.f, winSize.height - 6.f});
-            this->addChild(hud, 100);
-            m_fields->hudLabel = hud;
-        }
+        ensureTrajectoryNode();
+        refreshVisualSettings();
 
         return true;
     }
 
+    void ensureTrajectoryNode() {
+        if (m_fields->trajDraw || !m_objectLayer) return;
+        auto draw = CCDrawNode::create();
+        draw->setID("frame-assist-trajectory"_spr);
+        m_objectLayer->addChild(draw, 1500);
+        m_fields->trajDraw = draw;
+    }
+
+    void refreshVisualSettings() {
+        bool enabled = Mod::get()->getSettingValue<bool>("mod-enabled");
+        bool showHud = Mod::get()->getSettingValue<bool>("show-hud");
+        bool showTraj = getShowTrajectorySetting();
+        bool safeMode = Mod::get()->getSettingValue<bool>("safe-mode");
+
+        if (m_fields->hudLabel) {
+            m_fields->hudLabel->setVisible(enabled && showHud);
+        }
+
+        ensureTrajectoryNode();
+        if (m_fields->trajDraw) {
+            if (!enabled || !showTraj) {
+                m_fields->trajDraw->clear();
+                m_fields->trajDraw->setVisible(false);
+            } else {
+                m_fields->trajDraw->setVisible(true);
+            }
+        }
+
+        if (!enabled) {
+            auto base = static_cast<FrameAssistGameLayer*>(static_cast<GJBaseGameLayer*>(this));
+            base->clearPendingQueue();
+        }
+
+        if (enabled && safeMode) {
+            m_isTestMode = true;
+        }
+    }
+
     void destroyPlayer(PlayerObject* player, GameObject* obj) {
-        // Interceptar la muerte del jugador fantasma sin afectar al jugador real
         if (g_simulatingGhost || isGhostPlayer(player)) {
             g_ghostDied = true;
             return;
@@ -1419,7 +1425,10 @@ class $modify(FrameAssistPlayLayer, PlayLayer) {
         auto base = static_cast<FrameAssistGameLayer*>(static_cast<GJBaseGameLayer*>(this));
         base->resetAssistState();
         base->ensureInteractiveCache();
-        applySafeModeIfNeeded();
+        if (m_fields->trajDraw) {
+            m_fields->trajDraw->clear();
+        }
+        refreshVisualSettings();
     }
 
     void postUpdate(float dt) {
@@ -1428,45 +1437,121 @@ class $modify(FrameAssistPlayLayer, PlayLayer) {
         auto base = static_cast<FrameAssistGameLayer*>(static_cast<GJBaseGameLayer*>(this));
         base->tickFrameAssist(dt);
 
-        if (m_fields->hudLabel && m_player1) {
-            auto mode = detectVehicle(m_player1);
-            bool safeMode = Mod::get()->getSettingValue<bool>("safe-mode");
+        bool enabled = Mod::get()->getSettingValue<bool>("mod-enabled");
+        bool showHud = Mod::get()->getSettingValue<bool>("show-hud");
+        bool showTraj = getShowTrajectorySetting();
 
-            std::string stateStr;
-            if (base->hasPendingAction()) {
-                auto pending = base->getFrontPendingAction();
-                stateStr = fmt::format(
-                    "ESP {}->F:{}",
-                    pending.down ? "CLIC" : "SOLTAR",
-                    pending.targetFrame60
-                );
-                m_fields->hudLabel->setColor({255, 220, 90});
-            } else {
-                stateStr = fmt::format(
-                    "dx:{} s0:{} T:{}({})",
-                    base->getLastD0MovedX(),
-                    base->getLastD0Survival(),
-                    base->getLastDelayTicks(),
-                    base->getLastReason()
-                );
-                m_fields->hudLabel->setColor({150, 255, 160});
+        ensureTrajectoryNode();
+        if (m_fields->trajDraw) {
+            if (enabled && showTraj) {
+                base->renderPlayerTrajectory(m_fields->trajDraw);
+            } else if (m_fields->trajDraw->isVisible()) {
+                m_fields->trajDraw->clear();
+                m_fields->trajDraw->setVisible(false);
             }
+        }
 
-            m_fields->hudLabel->setString(fmt::format(
-                "F:{} {} S:{} {}{}",
-                base->getCurrentFrame60(),
-                vehicleName(mode),
-                base->getSavedInputsCount(),
-                stateStr,
-                safeMode ? " [S]" : ""
-            ).c_str());
+        if (m_fields->hudLabel) {
+            bool hudVisible = enabled && showHud;
+            m_fields->hudLabel->setVisible(hudVisible);
+
+            if (hudVisible && m_player1) {
+                auto mode = detectVehicle(m_player1);
+                bool safeMode = Mod::get()->getSettingValue<bool>("safe-mode");
+
+                std::string stateStr;
+                if (base->hasPendingAction()) {
+                    auto pending = base->getFrontPendingAction();
+                    stateStr = fmt::format(
+                        "ESP {}->F:{}",
+                        pending.down ? "CLIC" : "SOLTAR",
+                        pending.targetFrame60
+                    );
+                    m_fields->hudLabel->setColor({255, 220, 90});
+                } else {
+                    stateStr = fmt::format(
+                        "T:{}({})",
+                        base->getLastDelayTicks(),
+                        base->getLastReason()
+                    );
+                    m_fields->hudLabel->setColor({150, 255, 160});
+                }
+
+                m_fields->hudLabel->setString(fmt::format(
+                    "F:{} {} S:{} {}{}",
+                    base->getCurrentFrame60(),
+                    vehicleName(mode),
+                    base->getSavedInputsCount(),
+                    stateStr,
+                    safeMode ? " [S]" : ""
+                ).c_str());
+            }
+        }
+    }
+};
+
+// ============================================================================
+// 4. TUERQUITA DE CONFIGURACION EN EL MENU DE PAUSA DEL NIVEL (PauseLayer)
+// ============================================================================
+class $modify(FrameAssistPauseLayer, PauseLayer) {
+    struct Fields {
+        CCSprite* gearSprite = nullptr;
+        CCLabelBMFont* tagLabel = nullptr;
+    };
+
+    void customSetup() {
+        PauseLayer::customSetup();
+
+        auto winSize = CCDirector::get()->getWinSize();
+
+        auto menu = CCMenu::create();
+        menu->setID("frame-assist-pause-menu"_spr);
+        menu->setPosition({0.f, 0.f});
+        this->addChild(menu, 100);
+
+        auto btnNode = CCNode::create();
+        btnNode->setContentSize({44.f, 48.f});
+
+        auto gear = CCSprite::createWithSpriteFrameName("GJ_optionsBtn_001.png");
+        gear->setScale(0.64f);
+        gear->setPosition({22.f, 29.f});
+        btnNode->addChild(gear);
+        m_fields->gearSprite = gear;
+
+        auto tag = CCLabelBMFont::create("Assist", "goldFont.fnt");
+        tag->setScale(0.34f);
+        tag->setPosition({22.f, 6.f});
+        btnNode->addChild(tag);
+        m_fields->tagLabel = tag;
+
+        auto gearBtn = CCMenuItemSpriteExtra::create(
+            btnNode, this, menu_selector(FrameAssistPauseLayer::onOpenModConfig)
+        );
+        gearBtn->setID("frame-assist-config-btn"_spr);
+        gearBtn->setPosition({34.f, winSize.height - 34.f});
+        menu->addChild(gearBtn);
+
+        refreshGearVisual();
+    }
+
+    void refreshGearVisual() {
+        bool enabled = Mod::get()->getSettingValue<bool>("mod-enabled");
+        if (m_fields->gearSprite) {
+            m_fields->gearSprite->setColor(enabled ? ccColor3B{135, 255, 215} : ccColor3B{255, 130, 130});
+        }
+        if (m_fields->tagLabel) {
+            m_fields->tagLabel->setString(enabled ? "Assist" : "OFF");
         }
     }
 
-    void applySafeModeIfNeeded() {
-        if (Mod::get()->getSettingValue<bool>("mod-enabled") &&
-            Mod::get()->getSettingValue<bool>("safe-mode")) {
-            m_isTestMode = true;
-        }
+    void onOpenModConfig(CCObject*) {
+        auto popup = ModConfigPopup::create([this]() {
+            this->refreshGearVisual();
+            if (auto* pl = PlayLayer::get()) {
+                auto assistPL = static_cast<FrameAssistPlayLayer*>(pl);
+                assistPL->refreshVisualSettings();
+            }
+        });
+        if (popup) popup->show();
     }
 };
